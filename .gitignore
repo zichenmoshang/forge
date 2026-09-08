@@ -21,3 +21,7 @@ data/logs/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 临时文件
+git-push.bat
+git-push.log
