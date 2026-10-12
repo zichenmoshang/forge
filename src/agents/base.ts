@@ -128,6 +128,27 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
           await this.sleep(this.config.retryBaseDelayMs * attempt);
         }
 
+        // 预算控制（issue #39）：调用前检查累计是否超限，超限直接失败不再发起调用
+        const budget = context.tokenBudget;
+        if (budget?.isExceeded()) {
+          this.logger?.error(
+            `[${this.name}] Token 预算已超限（${budget.usedTokens}/${budget.limitTokens}），停止本次调用`,
+            { instanceId: context.instanceId, agent: this.name },
+          );
+          return this.buildFailure<TO>(
+            [
+              {
+                code: 'BUDGET_EXCEEDED',
+                message: `单流程 token 预算已超限（${budget.usedTokens}/${budget.limitTokens}），需人工调整预算或降级后重试`,
+                severity: 'error',
+              },
+            ],
+            startTime,
+            llmCalls,
+            retries,
+          );
+        }
+
         const llmRequest: LLMRequest = {
           prompt: userPrompt,
           systemPrompt,
@@ -140,6 +161,36 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
 
         const response = await this.llm.complete(llmRequest);
         llmCalls++;
+
+        // 预算控制：调用后累计本次 token；单次调用超限按失败处理（防异常膨胀）
+        if (budget) {
+          const perCall = budget.checkPerCall(response.totalTokens);
+          if (!perCall.ok) {
+            this.logger?.error(
+              `[${this.name}] 单次调用超限: ${perCall.reason}`,
+              { instanceId: context.instanceId, agent: this.name },
+            );
+            return this.buildFailure<TO>(
+              [
+                {
+                  code: 'CALL_LIMIT_EXCEEDED',
+                  message: perCall.reason ?? '单次调用 token 超过上限',
+                  severity: 'error',
+                },
+              ],
+              startTime,
+              llmCalls,
+              retries,
+            );
+          }
+          const acc = budget.add(response.totalTokens);
+          if (acc.exceeded) {
+            this.logger?.warn(
+              `[${this.name}] 本次调用后累计 token ${acc.used}/${acc.limit}，已触及预算上限`,
+              { instanceId: context.instanceId, agent: this.name },
+            );
+          }
+        }
 
         // 4. 解析输出
         let parsed: TO;
@@ -315,6 +366,163 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
       return content.slice(firstBrace, lastBrace + 1);
     }
     return content.trim();
+  }
+
+  /**
+   * 解析 JSON，失败时尝试恢复（处理 LLM 输出被截断、尾部不完整等问题）。
+   *
+   * 恢复策略：
+   * 1. 直接解析
+   * 2. 失败时，找到最后一个完整的结构边界，截断不完整尾部并补全闭合括号
+   * 3. 仍失败时，删除尾部多余逗号后重试
+   *
+   * @param jsonStr 提取后的 JSON 字符串
+   * @returns 解析后的对象
+   * @throws 恢复失败时抛出原始解析错误
+   */
+  protected parseJsonWithRecovery<T = unknown>(jsonStr: string): T {
+    // 1. 直接解析
+    try {
+      return JSON.parse(jsonStr) as T;
+    } catch (firstError) {
+      // 2. 尝试恢复：截断不完整的尾部并补全闭合括号
+      const recovered = this.recoverTruncatedJson(jsonStr);
+      if (recovered !== jsonStr) {
+        try {
+          return JSON.parse(recovered) as T;
+        } catch {
+          // 继续尝试其他恢复策略
+        }
+      }
+
+      // 3. 尝试删除尾部多余逗号
+      const trimmed = this.removeTrailingCommas(jsonStr);
+      if (trimmed !== jsonStr) {
+        try {
+          return JSON.parse(trimmed) as T;
+        } catch {
+          // 继续
+        }
+      }
+
+      // 4. 对恢复后的字符串再尝试删除尾部逗号
+      if (recovered !== jsonStr) {
+        const recoveredTrimmed = this.removeTrailingCommas(recovered);
+        try {
+          return JSON.parse(recoveredTrimmed) as T;
+        } catch {
+          // 全部失败，抛出原始错误
+        }
+      }
+
+      throw firstError;
+    }
+  }
+
+  /**
+   * 恢复被截断的 JSON：找到最后一个完整的结构边界，截断不完整尾部并补全闭合括号。
+   */
+  private recoverTruncatedJson(jsonStr: string): string {
+    // 从后往前扫描，跟踪括号深度，找到最后一个完整的对象/数组结束位置
+    let depth = 0;
+    let lastCompletePos = -1;
+    let inString = false;
+    let escape = false;
+
+    for (let i = 0; i < jsonStr.length; i++) {
+      const ch = jsonStr[i];
+
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+
+      if (ch === '{' || ch === '[') {
+        depth++;
+      } else if (ch === '}' || ch === ']') {
+        depth--;
+        if (depth === 0) {
+          lastCompletePos = i;
+        }
+      }
+    }
+
+    // 如果没有找到完整的顶层结构（depth > 0 说明被截断）
+    if (depth > 0 && lastCompletePos === -1) {
+      // 尝试找到最后一个完整的元素边界（逗号后）
+      const lastComma = jsonStr.lastIndexOf(',');
+      if (lastComma > 0) {
+        let truncated = jsonStr.slice(0, lastComma);
+        // 补全缺失的闭合括号
+        truncated = this.closeOpenBrackets(truncated);
+        return truncated;
+      }
+      return jsonStr;
+    }
+
+    // 如果有完整的顶层结构，但后面还有不完整的内容
+    if (lastCompletePos > 0 && lastCompletePos < jsonStr.length - 1) {
+      return jsonStr.slice(0, lastCompletePos + 1);
+    }
+
+    // 如果 depth > 0（被截断在中间），找到最后一个完整元素并截断
+    if (depth > 0) {
+      const lastComma = jsonStr.lastIndexOf(',');
+      if (lastComma > 0) {
+        let truncated = jsonStr.slice(0, lastComma);
+        truncated = this.closeOpenBrackets(truncated);
+        return truncated;
+      }
+    }
+
+    return jsonStr;
+  }
+
+  /**
+   * 补全字符串中未闭合的括号（从内到外）。
+   */
+  private closeOpenBrackets(str: string): string {
+    const openBrackets: string[] = [];
+    let inString = false;
+    let escape = false;
+
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+
+      if (ch === '{' || ch === '[') {
+        openBrackets.push(ch);
+      } else if (ch === '}' || ch === ']') {
+        openBrackets.pop();
+      }
+    }
+
+    // 从内到外补全闭合括号
+    let result = str;
+    for (let i = openBrackets.length - 1; i >= 0; i--) {
+      result += openBrackets[i] === '{' ? '}' : ']';
+    }
+    return result;
+  }
+
+  /**
+   * 删除数组/对象尾部多余的逗号（如 `[1, 2, ]` → `[1, 2]`）。
+   */
+  private removeTrailingCommas(jsonStr: string): string {
+    // 匹配 , 后面紧跟 ] 或 } 的情况（可能有空白）
+    return jsonStr.replace(/,\s*([\]}])/g, '$1');
   }
 
   private buildFailure<T>(

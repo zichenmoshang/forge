@@ -206,7 +206,11 @@ interface PipelineState {
 
 ## 状态持久化与恢复
 
-- 每次状态变更时，原子写入数据库 + `state.json` 快照
+> ✅ **实现状态（#82 已落地）**：每次状态变更时经 StateMachine.onStateChange 回调写 `state.json`
+> （FileSystemArtifactStore），Harness 构造时检测快照并 `continueFromSnapshot`，CLI `--resume <instanceId>` 续跑；
+> 数据库写入为目标态（v2）。
+
+- 目标态：每次状态变更时，原子写入数据库 + `state.json` 快照
 - Harness 重启时，扫描所有 `status` 不属于 completed / failed / cancelled 的实例
 - `status = suspended` → 保持挂起，等人工恢复
 - `status = waiting_human` → 保持等待，等人工输入

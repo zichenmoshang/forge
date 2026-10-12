@@ -11,9 +11,9 @@
  */
 
 import { BaseAgent } from './base';
-import type { AgentError, AgentContext } from './types';
+import type { AgentError, AgentContext, AgentResult } from './types';
 import type { StructuredRequirement } from '../types/requirement';
-import type { UserStorySet } from '../types/user-story';
+import type { UserStorySet, UserStory, AcceptanceCriterion } from '../types/user-story';
 import type { KnowledgeItem } from '../types/knowledge';
 import {
   CLARIFICATION_SYSTEM_PROMPT,
@@ -51,6 +51,175 @@ export type RequirementAgentOutput = StructuredRequirement | UserStorySet;
 export class RequirementAgent extends BaseAgent<RequirementAgentInput, RequirementAgentOutput> {
   readonly name = 'requirement-agent';
   readonly version = '0.1.0';
+
+  // ============================================================
+  // 分批执行：generate-stories 按 module 分组逐批调用 LLM，避免单批次输出过大超时
+  // ============================================================
+
+  /** 分批阈值：功能点超过此数量时按 module 分批处理 */
+  private static readonly BATCH_THRESHOLD = 6;
+  /** 每批最大功能点数量：超过此数量的 module 会进一步拆分（避免单批次输出过大超时，实测 6 个约 10 分钟，8 个会 15 分钟超时） */
+  private static readonly MAX_FEATURES_PER_BATCH = 6;
+
+  async execute(context: AgentContext): Promise<AgentResult<RequirementAgentOutput>> {
+    const input = context.input as RequirementAgentInput;
+
+    // 只有 generate-stories 且功能点超过阈值才分批
+    if (input.type !== 'generate-stories' || !input.requirement || input.requirement.features.length <= RequirementAgent.BATCH_THRESHOLD) {
+      return super.execute(context);
+    }
+
+    const requirement = input.requirement;
+
+    // 按 module 分组，每个 module 超过 MAX_FEATURES_PER_BATCH 时进一步拆分
+    const batches: Array<{ name: string; features: typeof requirement.features }> = [];
+    const moduleGroups = new Map<string, typeof requirement.features>();
+    for (const feature of requirement.features) {
+      const module = feature.module || '未分类';
+      if (!moduleGroups.has(module)) moduleGroups.set(module, []);
+      moduleGroups.get(module)!.push(feature);
+    }
+    for (const [moduleName, features] of moduleGroups) {
+      if (features.length <= RequirementAgent.MAX_FEATURES_PER_BATCH) {
+        batches.push({ name: moduleName, features });
+      } else {
+        // 大 module 拆分成多个子批次
+        for (let i = 0; i < features.length; i += RequirementAgent.MAX_FEATURES_PER_BATCH) {
+          const subFeatures = features.slice(i, i + RequirementAgent.MAX_FEATURES_PER_BATCH);
+          batches.push({ name: `${moduleName}-${Math.floor(i / RequirementAgent.MAX_FEATURES_PER_BATCH) + 1}`, features: subFeatures });
+        }
+      }
+    }
+
+    // 只有 1 个批次时走单次模式
+    if (batches.length <= 1) {
+      return super.execute(context);
+    }
+
+    this.logger?.info(
+      `[${this.name}] 故事拆解分批并行处理：${batches.length} 批，${requirement.features.length} 个功能点`,
+      { instanceId: context.instanceId, agent: this.name },
+    );
+
+    // 并行执行所有批次（限制并发数 3，避免 API 限流）
+    const MAX_CONCURRENCY = 3;
+    const startTime = Date.now();
+    const results: Array<AgentResult<UserStorySet> | null> = new Array(batches.length).fill(null);
+    let nextBatchIndex = 0;
+
+    const runBatch = async (workerId: number): Promise<void> => {
+      while (true) {
+        const idx = nextBatchIndex++;
+        if (idx >= batches.length) return;
+
+        const batch = batches[idx];
+        const subRequirement: StructuredRequirement = { ...requirement, features: batch.features };
+        const subInput: StoryGenerationInput = { type: 'generate-stories', requirement: subRequirement };
+        const subContext: AgentContext = { ...context, input: subInput, stage: `${context.stage}:${batch.name}` };
+
+        try {
+          const result = await this.runAgentCycle<StoryGenerationInput, UserStorySet>({
+            input: subInput,
+            context: subContext,
+            validateInput: (i: StoryGenerationInput) => this.validateStoryInput(i),
+            retrieveKnowledge: (i: StoryGenerationInput, ctx: AgentContext) => this.retrieveKnowledge(i, ctx),
+            buildSystemPrompt: () => this.buildStorySystemPrompt(),
+            buildUserPrompt: (i: StoryGenerationInput) => Promise.resolve(this.buildStoryUserPrompt(i)),
+            parseOutput: (content: string, i: StoryGenerationInput) => this.parseStoryOutput(content, i),
+            validateOutput: (output: UserStorySet) => this.validateStoryOutput(output),
+            selfCheck: (output: UserStorySet) => this.selfCheckStory(output),
+          });
+          results[idx] = result;
+
+          if (!result.success || !result.data) {
+            this.logger?.error(
+              `[${this.name}] 故事拆解批次 [${batch.name}] 失败`,
+              { instanceId: context.instanceId, agent: this.name, errors: result.errors },
+            );
+          } else {
+            this.logger?.info(
+              `[${this.name}] 批次 [${batch.name}] 完成：${result.data.stories.length} 个故事，${result.llmCalls} 次 LLM 调用`,
+              { instanceId: context.instanceId, agent: this.name },
+            );
+          }
+        } catch (err) {
+          this.logger?.error(
+            `[${this.name}] 批次 [${batch.name}] 异常：${err instanceof Error ? err.message : String(err)}`,
+            { instanceId: context.instanceId, agent: this.name },
+          );
+          results[idx] = {
+            success: false,
+            data: undefined,
+            errors: [{ code: 'BATCH_ERROR', message: `批次执行异常: ${err instanceof Error ? err.message : String(err)}`, severity: 'error' }],
+            durationMs: 0,
+            llmCalls: 0,
+            retries: 0,
+          };
+        }
+      }
+    };
+
+    // 启动并发 worker
+    const workers = Array.from({ length: Math.min(MAX_CONCURRENCY, batches.length) }, (_, i) =>
+      runBatch(i),
+    );
+    await Promise.all(workers);
+
+    const wallClockTime = Date.now() - startTime;
+    const allStories: UserStorySet['stories'] = [];
+    let totalLlmCalls = 0;
+    let totalDuration = 0;
+    let totalRetries = 0;
+    const allErrors: AgentError[] = [];
+    let hasFailure = false;
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (!result) {
+        hasFailure = true;
+        allErrors.push({ code: 'BATCH_MISSING', message: `批次 ${i + 1} 未返回结果`, severity: 'error' });
+        continue;
+      }
+      totalLlmCalls += result.llmCalls;
+      totalDuration += result.durationMs;
+      totalRetries += result.retries;
+      allErrors.push(...result.errors);
+      if (!result.success || !result.data) {
+        hasFailure = true;
+      } else {
+        allStories.push(...result.data.stories);
+      }
+    }
+
+    if (hasFailure) {
+      return {
+        success: false,
+        data: undefined,
+        errors: allErrors,
+        durationMs: wallClockTime,
+        llmCalls: totalLlmCalls,
+        retries: totalRetries,
+      };
+    }
+
+    // 构造合并后的伪 LLM 输出，复用 parseStoryOutput 计算 qualityCheck 和 storyMap
+    const mergedRawOutput = JSON.stringify({ stories: allStories });
+    const merged = this.parseStoryOutput(mergedRawOutput, input);
+
+    this.logger?.info(
+      `[${this.name}] 故事拆解分批并行完成：${allStories.length} 个故事，${batches.length} 批，墙钟时间 ${(wallClockTime / 1000).toFixed(1)}s，累计 LLM 时间 ${(totalDuration / 1000).toFixed(1)}s`,
+      { instanceId: context.instanceId, agent: this.name },
+    );
+
+    return {
+      success: true,
+      data: merged,
+      errors: allErrors,
+      durationMs: wallClockTime,
+      llmCalls: totalLlmCalls,
+      retries: totalRetries,
+    };
+  }
 
   // ============================================================
   // BaseAgent 抽象方法实现（按 input.type 分发）
@@ -201,9 +370,18 @@ ${resolvedQuestions || '（无）'}
 仍待澄清的问题：
 ${pendingQuestions || '（无）'}
 
-请基于人工回答更新需求，并判断是否还有新的澄清问题。如果需求已经充分，clarificationLog 可以为空数组。
+【输出要求 — 增量模式，不要输出完整需求】
+只输出以下两部分：
+1. clarificationLog（必填）：更新后的澄清问题列表。已解决的问题标记 status: "resolved"，新问题标记 status: "pending"。如果没有任何待澄清的新问题，输出空数组 []。
+2. updates（可选）：只有当人工回答导致需求内容实际变更时才输出。包含需要更新的字段（如 features、businessRules、nonFunctionalRequirements 等），每个字段输出完整的更新后数组。如果没有内容变更，不要输出 updates。
 
-输出格式与第一轮相同（严格 JSON）。`;
+示例（无内容变更，仅更新澄清状态）：
+{"clarificationLog": [{"id": "Q-001", "question": "...", "status": "resolved"}, {"id": "Q-002", "question": "...", "status": "pending"}]}
+
+示例（有内容变更）：
+{"clarificationLog": [], "updates": {"features": [{"id": "F-001", ...}, {"id": "F-002", ...}], "nonFunctionalRequirements": [{"id": "N-001", ...}]}}
+
+输出严格 JSON，不要包含解释性文字。`;
   }
 
   private parseClarificationOutput(
@@ -211,23 +389,96 @@ ${pendingQuestions || '（无）'}
     input: ClarificationInput | ClarificationFollowupInput,
   ): StructuredRequirement {
     const jsonStr = this.extractJsonObject(content);
-    const parsed = JSON.parse(jsonStr);
+    const parsed = this.parseJsonWithRecovery<Record<string, any>>(jsonStr);
 
     const now = new Date().toISOString();
     const isFollowup = input.type === 'clarify-followup';
     const prev = isFollowup ? (input as ClarificationFollowupInput).previousRequirement : undefined;
 
+    // ============================================================
+    // followup 增量模式：以 previousRequirement 为基础，合并 LLM 输出的增量
+    // 支持两种输出格式：
+    //   1. 增量格式：{ clarificationLog: [...], updates: { features: [...], ... } }
+    //   2. 全量格式（兼容）：直接输出 meta/features/... 等顶层字段
+    // ============================================================
+    if (isFollowup && prev) {
+      // 深拷贝 previousRequirement 作为基础
+      const result: StructuredRequirement = JSON.parse(JSON.stringify(prev));
+      result.version = prev.version + 1;
+      result.updatedAt = now;
+      result.meta.frozenAt = '';
+      result.frozen = {
+        frozen: false,
+        frozenAt: '',
+        checklist: {
+          businessGoalsClear: false,
+          rolesComplete: false,
+          featuresNoMissing: false,
+          rulesNoAmbiguity: false,
+          nfrDefined: false,
+          globalRequirementsCovered: false,
+          trackingProvided: false,
+          allClarificationsResolved: false,
+        },
+      };
+
+      const updatableFields = [
+        'businessGoals', 'roles', 'features', 'businessRules',
+        'nonFunctionalRequirements', 'globalRequirements', 'trackingRequirements',
+      ] as const;
+
+      // 1. 应用 clarificationLog 更新（如果输出了该字段，即使是空数组也替换，表示无新问题）
+      if (parsed.clarificationLog !== undefined) {
+        result.clarificationLog = parsed.clarificationLog;
+      }
+
+      // 2. 应用 updates 中的字段变更（增量格式）
+      if (parsed.updates && typeof parsed.updates === 'object') {
+        for (const field of updatableFields) {
+          if (parsed.updates[field] !== undefined) {
+            (result as unknown as Record<string, unknown>)[field] = parsed.updates[field];
+          }
+        }
+        if (parsed.updates.meta?.title) {
+          result.meta.title = parsed.updates.meta.title;
+        }
+      }
+
+      // 3. 兼容全量输出：如果 LLM 直接输出了顶层字段（且 updates 中没有同名字段），用顶层值替换
+      for (const field of updatableFields) {
+        if (parsed.updates?.[field] === undefined && parsed[field] !== undefined) {
+          (result as unknown as Record<string, unknown>)[field] = parsed[field];
+        }
+      }
+      if (parsed.meta) {
+        if (parsed.meta.title && !parsed.updates?.meta?.title) {
+          result.meta.title = parsed.meta.title;
+        }
+        if (parsed.meta.version) {
+          result.meta.version = parsed.meta.version;
+        }
+      }
+
+      // 保留 humanAnswers（由 Harness 管理）
+      if (prev.humanAnswers) {
+        result.humanAnswers = prev.humanAnswers;
+      }
+
+      return result;
+    }
+
+    // ============================================================
+    // 首次澄清模式
+    // ============================================================
     return {
-      id: prev?.id || `req-${Date.now()}`,
-      instanceId: prev?.instanceId || '', // 由 Harness 填充
-      version: prev ? prev.version + 1 : 1,
+      id: `req-${Date.now()}`,
+      instanceId: '', // 由 Harness 填充
+      version: 1,
       meta: {
-        title: parsed.meta?.title || prev?.meta.title || '未命名需求',
-        source: isFollowup
-          ? prev?.meta.source || '未知来源'
-          : (input as ClarificationInput).source || parsed.meta?.source || '未知来源',
-        version: parsed.meta?.version || prev?.meta.version || '1.0',
-        parsedAt: prev?.meta.parsedAt || now,
+        title: parsed.meta?.title || '未命名需求',
+        source: (input as ClarificationInput).source || parsed.meta?.source || '未知来源',
+        version: parsed.meta?.version || '1.0',
+        parsedAt: now,
         frozenAt: '',
       },
       businessGoals: parsed.businessGoals || [],
@@ -377,95 +628,99 @@ ${pendingQuestions || '（无）'}
 
   private parseStoryOutput(content: string, input: StoryGenerationInput): UserStorySet {
     const jsonStr = this.extractJsonObject(content);
-    const parsed = JSON.parse(jsonStr);
+    const parsed = this.parseJsonWithRecovery<Record<string, any>>(jsonStr);
 
     const now = new Date().toISOString();
-    const stories = parsed.stories || [];
+    const rawStories = parsed.stories || [];
+
+    // 将简化的故事转换为完整 UserStory
+    const stories: UserStory[] = rawStories.map((s: any, idx: number) => ({
+      id: s.id || `s${idx + 1}`,
+      title: s.title || '',
+      description: {
+        role: s.description?.role || '',
+        action: s.description?.action || '',
+        benefit: s.description?.benefit || '',
+      },
+      acceptanceCriteria: this.parseAcceptanceCriteria(s.acceptanceCriteria, s.id || `s${idx + 1}`),
+      priority: s.priority || 'P1',
+      dependencies: s.dependencies || [],
+      relatedFeatureIds: s.relatedFeatureIds || [],
+      relatedRuleIds: s.relatedRuleIds || [],
+      type: s.type || 'feature',
+      hasExceptionFlow: (s.acceptanceCriteria || []).some((ac: string | any) =>
+        typeof ac === 'string'
+          ? /异常|边界|错误|失败|权限|未登录/.test(ac)
+          : ac.scenarioType !== 'normal',
+      ),
+    }));
 
     // 计算质量检查
-    const totalAC = stories.reduce(
-      (sum: number, s: { acceptanceCriteria: unknown[] }) =>
-        sum + (s.acceptanceCriteria?.length || 0),
-      0,
-    );
+    const totalAC = stories.reduce((sum, s) => sum + s.acceptanceCriteria.length, 0);
     const testableAC = stories.reduce(
-      (sum: number, s: { acceptanceCriteria: { testable: boolean }[] }) =>
-        sum + (s.acceptanceCriteria?.filter((ac) => ac.testable).length || 0),
+      (sum, s) => sum + s.acceptanceCriteria.filter((ac) => ac.testable !== false).length,
       0,
     );
 
     const featureIds = new Set(input.requirement.features.map((f) => f.id));
     const coveredFeatureIds = new Set<string>();
     for (const story of stories) {
-      for (const fid of story.relatedFeatureIds || []) {
+      for (const fid of story.relatedFeatureIds) {
         coveredFeatureIds.add(fid);
       }
     }
     const uncoveredFeatureIds = [...featureIds].filter((fid) => !coveredFeatureIds.has(fid));
 
-    // INVEST：I/N/V/E 取 LLM 自评分（prompt 要求输出，缺失时降级为通过并记入 issues）；
-    // Small/Testable 必须由程序计算，不信任 LLM，防止自检形同虚设
-    const llmInvest: Partial<{
-      independent: boolean;
-      negotiable: boolean;
-      valuable: boolean;
-      estimable: boolean;
-    }> = parsed.qualityCheck?.invest ?? {};
-    const investIssues: string[] = [];
-    if (!parsed.qualityCheck?.invest) {
-      investIssues.push(
-        'LLM 未输出 qualityCheck.invest 自评分，I/N/V/E 按通过处理，请关注模型输出完整性',
-      );
-    }
+    // INVEST：全部由程序计算（不再依赖 LLM 自评分）
     const invest = {
-      independent: llmInvest.independent ?? true,
-      negotiable: llmInvest.negotiable ?? true,
-      valuable: llmInvest.valuable ?? true,
-      estimable: llmInvest.estimable ?? true,
-      small: stories.every(
-        (s: { acceptanceCriteria: unknown[] }) => (s.acceptanceCriteria?.length || 0) <= 10,
-      ),
+      independent: stories.every((s) => s.dependencies.length === 0),
+      negotiable: true, // 程序无法判断，默认通过
+      valuable: stories.every((s) => s.description.benefit.length > 0),
+      estimable: stories.every((s) => s.acceptanceCriteria.length > 0),
+      small: stories.every((s) => s.acceptanceCriteria.length <= 5),
       testable: testableAC === totalAC,
     };
     const investPassed = Object.values(invest).every(Boolean);
 
-    // perStory 逐故事质量检查（程序化，不信任 LLM 自评分，规范 1.14）
-    const storyIdSet = new Set(stories.map((s: { id: string }) => s.id));
-    const perStory = stories.map(
-      (s: {
-        id: string;
-        acceptanceCriteria?: Array<{ testable?: boolean; id?: string }>;
-        dependencies?: string[];
-      }) => {
-        const issues: string[] = [];
-        const acCount = s.acceptanceCriteria?.length ?? 0;
-        const notTestableACs = s.acceptanceCriteria?.filter((ac) => ac.testable === false) ?? [];
-        const unknownDeps = (s.dependencies ?? []).filter((depId) => !storyIdSet.has(depId));
+    // perStory 逐故事质量检查
+    const storyIdSet = new Set(stories.map((s) => s.id));
+    const perStory = stories.map((s) => {
+      const issues: string[] = [];
+      const acCount = s.acceptanceCriteria.length;
+      const notTestableACs = s.acceptanceCriteria.filter((ac) => ac.testable === false);
+      const unknownDeps = s.dependencies.filter((depId) => !storyIdSet.has(depId));
 
-        // Small：AC 数超过阈值（10 条）视为故事过大，建议拆分
-        if (acCount > 10) {
-          issues.push(`故事过大：包含 ${acCount} 条验收标准（阈值 10），建议拆分为多个小故事`);
-        }
-        // Testable：存在标记为不可测试的 AC
-        if (notTestableACs.length > 0) {
-          issues.push(
-            `存在 ${notTestableACs.length} 条不可测试的验收标准：${notTestableACs.map((ac) => ac.id).join(', ')}`,
-          );
-        }
-        // Independent：依赖了未在当前故事集合中的故事（可能依赖未拆解的输出）
-        if (unknownDeps.length > 0) {
-          issues.push(
-            `依赖了未定义的故事：${unknownDeps.join(', ')}（可能依赖未拆解的故事输出，影响独立性）`,
-          );
-        }
+      if (acCount > 5) {
+        issues.push(`故事过大：包含 ${acCount} 条验收标准（阈值 5），建议拆分`);
+      }
+      if (acCount < 2) {
+        issues.push(`验收标准不足：仅 ${acCount} 条（建议至少 2 条：正常+异常）`);
+      }
+      if (notTestableACs.length > 0) {
+        issues.push(`存在 ${notTestableACs.length} 条不可测试的验收标准`);
+      }
+      if (unknownDeps.length > 0) {
+        issues.push(`依赖了未定义的故事：${unknownDeps.join(', ')}`);
+      }
 
-        return {
-          storyId: s.id,
-          issues,
-          passed: issues.length === 0,
-        };
-      },
-    );
+      return { storyId: s.id, issues, passed: issues.length === 0 };
+    });
+
+    // 生成 storyMap：按功能点 module 分组
+    const featureModuleMap = new Map(input.requirement.features.map((f) => [f.id, f.module || '未分类']));
+    const moduleGroups = new Map<string, string[]>();
+    for (const story of stories) {
+      const module = story.relatedFeatureIds.length > 0
+        ? (featureModuleMap.get(story.relatedFeatureIds[0]) || '未分类')
+        : '未分类';
+      if (!moduleGroups.has(module)) moduleGroups.set(module, []);
+      moduleGroups.get(module)!.push(story.id);
+    }
+    const storyMap = [...moduleGroups.entries()].map(([groupName, storyIds], idx) => ({
+      groupName,
+      storyIds,
+      order: idx,
+    }));
 
     return {
       id: `stories-${Date.now()}`,
@@ -473,8 +728,8 @@ ${pendingQuestions || '（无）'}
       requirementId: input.requirement.id,
       version: 1,
       stories,
-      storyMap: parsed.storyMap || [],
-      nfrMapping: parsed.nfrMapping || [],
+      storyMap,
+      nfrMapping: [], // 技术方案阶段处理
       qualityCheck: {
         invest,
         perStory,
@@ -493,7 +748,6 @@ ${pendingQuestions || '（无）'}
           ...(uncoveredFeatureIds.length > 0
             ? [`有 ${uncoveredFeatureIds.length} 个功能点未被故事覆盖`]
             : []),
-          ...investIssues,
         ],
       },
       confirmation: {
@@ -504,6 +758,60 @@ ${pendingQuestions || '（无）'}
       createdAt: now,
       updatedAt: now,
     };
+  }
+
+  /** 将简化的验收标准字符串数组转换为 AcceptanceCriterion[] */
+  private parseAcceptanceCriteria(rawACs: Array<string | any>, storyId: string): AcceptanceCriterion[] {
+    if (!Array.isArray(rawACs) || rawACs.length === 0) return [];
+
+    return rawACs.map((ac, idx) => {
+      if (typeof ac === 'object' && ac !== null) {
+        // 兼容完整对象格式
+        return {
+          id: ac.id || `${storyId}-ac${idx + 1}`,
+          given: ac.given || [],
+          when: ac.when || '',
+          then: ac.then || [],
+          scenarioType: ac.scenarioType || 'normal',
+          testable: ac.testable !== false,
+        };
+      }
+
+      // 字符串格式："正常场景：给定...当...则..."
+      const text = String(ac);
+      const scenarioType: AcceptanceCriterion['scenarioType'] = /异常|边界|错误|失败/.test(text)
+        ? 'exception'
+        : /权限|未登录|无权/.test(text)
+          ? 'permission'
+          : /边界|极限|空|最大|最小/.test(text)
+            ? 'boundary'
+            : 'normal';
+
+      // 简单解析 Given/When/Then
+      let given: string[] = [];
+      let when = '';
+      let then: string[] = [];
+
+      const givenMatch = text.match(/给定(.+?)(?:当|则|$)/);
+      const whenMatch = text.match(/当(.+?)(?:则|$)/);
+      const thenMatch = text.match(/则(.+?)$/);
+
+      if (givenMatch) given = [givenMatch[1].trim()];
+      if (whenMatch) when = whenMatch[1].trim();
+      if (thenMatch) then = [thenMatch[1].trim()];
+
+      // 如果解析失败，将整个文本作为 when
+      if (!when && !then.length) when = text;
+
+      return {
+        id: `${storyId}-ac${idx + 1}`,
+        given,
+        when,
+        then,
+        scenarioType,
+        testable: true,
+      };
+    });
   }
 
   private validateStoryOutput(output: UserStorySet): AgentError[] {

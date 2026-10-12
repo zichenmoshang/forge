@@ -116,9 +116,17 @@ export function createInitialState(instanceId: string): PipelineState {
  */
 export class StateMachine {
   private state: PipelineState;
+  /** 状态变更回调（issue #82：每次变更后持久化快照） */
+  private readonly onStateChange?: (state: PipelineState) => void;
 
-  constructor(initialState: PipelineState) {
+  constructor(initialState: PipelineState, options?: { onStateChange?: (state: PipelineState) => void }) {
     this.state = { ...initialState };
+    this.onStateChange = options?.onStateChange;
+  }
+
+  /** 状态变更后通知外部（快照持久化等），传入深拷贝避免外部修改内部状态 */
+  private notifyChange(): void {
+    this.onStateChange?.(structuredClone(this.state));
   }
 
   /** 获取当前状态（深拷贝，防止外部修改内部状态） */
@@ -195,6 +203,8 @@ export class StateMachine {
       this.state.status = 'running';
     }
 
+    this.notifyChange();
+
     return {
       success: true,
       from,
@@ -226,6 +236,8 @@ export class StateMachine {
     // （简化实现：清除所有重试计数，实际可按状态范围清除）
     this.state.retryCount = {};
 
+    this.notifyChange();
+
     return {
       success: true,
       from,
@@ -245,6 +257,8 @@ export class StateMachine {
     this.state.currentState = 'SUSPENDED';
     this.state.status = 'suspended';
     this.state.updatedAt = new Date().toISOString();
+
+    this.notifyChange();
 
     return {
       success: true,
@@ -276,6 +290,8 @@ export class StateMachine {
     this.state.status = isHardBlockingState(fromState) ? 'waiting_human' : 'running';
     this.state.updatedAt = new Date().toISOString();
 
+    this.notifyChange();
+
     return {
       success: true,
       from,
@@ -291,6 +307,8 @@ export class StateMachine {
     this.state.currentState = 'FAILED';
     this.state.status = 'failed';
     this.state.updatedAt = new Date().toISOString();
+
+    this.notifyChange();
 
     return {
       success: true,
@@ -308,6 +326,8 @@ export class StateMachine {
     this.state.currentState = 'CANCELLED';
     this.state.status = 'cancelled';
     this.state.updatedAt = new Date().toISOString();
+
+    this.notifyChange();
 
     return {
       success: true,
@@ -336,6 +356,8 @@ export class StateMachine {
     this.state.status = 'completed';
     this.state.updatedAt = new Date().toISOString();
 
+    this.notifyChange();
+
     return {
       success: true,
       from,
@@ -355,6 +377,7 @@ export class StateMachine {
     this.state.status = 'waiting_human';
     this.state.waitingFor = waitingFor;
     this.state.updatedAt = new Date().toISOString();
+    this.notifyChange();
   }
 
   /** 从原地等待恢复为运行中（pauseForHuman 的逆操作） */
@@ -362,6 +385,7 @@ export class StateMachine {
     this.state.status = 'running';
     this.state.waitingFor = undefined;
     this.state.updatedAt = new Date().toISOString();
+    this.notifyChange();
   }
 
   /** 增加重试计数 */
@@ -370,6 +394,7 @@ export class StateMachine {
     const current = this.state.retryCount[target] ?? 0;
     this.state.retryCount[target] = current + 1;
     this.state.updatedAt = new Date().toISOString();
+    this.notifyChange();
     return this.state.retryCount[target];
   }
 

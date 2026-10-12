@@ -2,32 +2,37 @@
 
 ## 总体方案
 
-v1 用 **PostgreSQL + pgvector + 本地文件系统** 三件套，不引入更多组件。
+目标态用 **PostgreSQL + pgvector + 本地文件系统** 三件套，不引入更多组件。
 
-| 存储 | 用途 |
-|---|---|
-| PostgreSQL | 流程状态、产物元数据、符号索引、span、指标、配置 |
-| pgvector | 知识库向量、代码语义索引向量 |
-| 本地文件系统 | 产物完整内容、代码文件、图片、日志、临时文件 |
+> ⚠️ **实现状态（#85 同步）**：v1 实际为「本地文件系统 + 内存向量库」——
+> 产物/状态/日志全部落盘 `data/`（FileSystemArtifactStore + `state.json` 快照，#82 已实现），
+> 向量检索为 `InMemoryVectorStore`（进程内，重启丢失，pgvector 持久化为 v2 目标）。
+> 以下目标态设计（PostgreSQL/pgvector/表结构）均以「v2 目标」标注，v1 不实现。
+
+| 存储 | 用途 | v1 实际 |
+|---|---|---|
+| PostgreSQL（目标态） | 流程状态、产物元数据、符号索引、span、指标、配置 | — 未实现，状态/元数据暂存文件 |
+| pgvector（目标态） | 知识库向量、代码语义索引向量 | — 未实现，v1 用 InMemoryVectorStore |
+| 本地文件系统 | 产物完整内容、代码文件、图片、日志、临时文件 | ✅ 已实现（data/instances/{id}） |
 
 ## 数据分类与存储
 
-| 数据类型 | 存储位置 | 说明 |
-|---|---|---|
-| 流程状态 | PostgreSQL | 实例表，当前状态、重试次数、挂起状态 |
-| 产物元数据 | PostgreSQL | 产物表，关联实例、阶段、版本、文件路径 |
+| 数据类型 | 目标存储 | 说明 | v1 实际 |
+|---|---|---|---|
+| 流程状态 | PostgreSQL | 实例表，当前状态、重试次数、挂起状态 | ✅ `data/instances/{id}/state.json` 快照（#82） |
+| 产物元数据 | PostgreSQL | 产物表，关联实例、阶段、版本、文件路径 | ✅ FileSystemArtifactStore 文件系统实现 |
 | 产物完整内容 | 文件系统 | 大文本（方案/代码）存文件，DB 存路径 |
-| 版本历史 | PostgreSQL + 文件系统 | 每次生成新版本，不覆盖旧版本 |
-| 人工介入记录 | PostgreSQL | 问题、回答、时间、超时状态 |
-| 项目配置 | PostgreSQL | 技术栈、目录规范、团队约束 |
-| 符号索引 | PostgreSQL | 项目ID、符号名、类型、文件路径、行号 |
-| 向量索引 | pgvector | 知识库向量、代码语义向量 |
-| 依赖关系图 | PostgreSQL | 文件间 import/export 关系 |
-| 链路 span | PostgreSQL | 按实例查完整调用链 |
-| 指标 | PostgreSQL | 定时聚合，成功率/耗时/token/成本 |
-| LLM 调用记录 | PostgreSQL + 文件系统 | 元数据存 DB，完整 prompt/response 存文件 |
-| 日志 | 文件系统 | 按实例分文件 |
-| 临时文件 | 文件系统 | 测试运行产物、缓存，TTL 自动清理 |
+| 版本历史 | PostgreSQL + 文件系统 | 每次生成新版本，不覆盖旧版本 | ✅ 文件系统 artifacts/vN 目录 |
+| 人工介入记录 | PostgreSQL | 问题、回答、时间、超时状态 | ✅ 快照/评审历史随 state.json + artifacts 落盘 |
+| 项目配置 | PostgreSQL | 技术栈、目录规范、团队约束 | ✅ 配置在 .env / 代码常量 |
+| 符号索引 | PostgreSQL | 项目ID、符号名、类型、文件路径、行号 | ⏳ 目标态（ASTParser 已具备提取能力） |
+| 向量索引 | pgvector | 知识库向量、代码语义向量 | ✅ InMemoryVectorStore（重启丢失，#84 跟进） |
+| 依赖关系图 | PostgreSQL | 文件间 import/export 关系 | ⏳ 目标态 |
+| 链路 span | PostgreSQL | 按实例查完整调用链 | ⏳ 目标态（v1 靠日志时间线） |
+| 指标 | PostgreSQL | 定时聚合，成功率/耗时/token/成本 | ⏳ 目标态（Logger 已含 token 统计输出） |
+| LLM 调用记录 | PostgreSQL + 文件系统 | 元数据存 DB，完整 prompt/response 存文件 | ✅ 文件 `logs/llm.log`（logger.ts） |
+| 日志 | 文件系统 | 按实例分文件 | ✅ pipeline.log / error.log |
+| 临时文件 | 文件系统 | 测试运行产物、缓存，TTL 自动清理 | ✅ .sandbox/tdd-* 运行后清理 |
 
 ## 目录结构
 
@@ -85,29 +90,21 @@ data/
 
 ### 崩溃恢复
 
-每个阶段开始和结束时，状态快照写入 `state.json` 和数据库。
-
-Harness 重启时：
-1. 读取所有未完成的流程实例（终态 completed / failed / cancelled 不恢复）
-2. 从最后一个完成的阶段恢复
-3. 未完成的阶段重新执行（产物不可变，重复执行安全）
+> ✅ **实现状态（#82 已落地）**：每个阶段状态变更时写 `state.json`（FileSystemArtifactStore + StateMachine onStateChange），
+> Harness 构造时检测快照并恢复（`continueFromSnapshot`），CLI 通过 `--resume <instanceId>` 续跑；
+> 评审/编码等未完成的阶段从已保存的对话历史（design-review-history / code-review-history）续跑。
+> 目标态：增加数据库写入与未完成实例扫描，多实例并发安全。
 
 ### 临时数据自动清理
 
 测试运行中间产物、缓存文件设置 TTL，定期清理，避免磁盘膨胀。
 
-## pgvector 配置
+## pgvector 配置（目标态）
 
 ### 向量维度
 
-使用 **通义 Qwen3-Embedding**，输出 **1024 维**向量。
-
-选择 1024 维的理由：
-- pgvector 的甜点区，HNSW 索引性能好
-- 区分度足够，中文场景召回率高
-- 存储成本合理（每条向量约 4KB）
-- 3072 维存储和计算成本翻倍，延迟明显增加
-- 512 维区分度不够，中文场景召回率下降 10-15%
+> ⚠️ **已变更**：v1 实际使用 **火山引擎 Doubao-embedding-vision-251215**（多模态 API，`/embeddings/multimodal` 端点），输出 **2048 维**（选型见 docs/04-knowledge-base.md）。
+> 本节 pgvector/HNSW 维度参数为 v2 目标态，落地时以实际 embedding 维度为准。
 
 ### 向量索引
 
@@ -161,7 +158,7 @@ WITH (m = 16, ef_construction = 64);
 | title | VARCHAR(500) | 标题/名称 |
 | content | TEXT | 完整内容（结构化 JSON 或文本） |
 | summary | VARCHAR(1000) | 摘要（用于检索结果展示） |
-| embedding | vector(1024) | 向量（Qwen3-Embedding） |
+| embedding | vector(2048) | 向量（Doubao-embedding-vision，v2 落地时按实际维度调整） |
 | source | VARCHAR(100) | 来源：code/pr/feishu/manual |
 | source_ref | VARCHAR(500) | 来源引用（文件路径/PR号/飞书文档ID） |
 | project_scope | VARCHAR(100) | 项目范围：global/{project_id} |
@@ -195,6 +192,9 @@ v1 不需要，三件套足够。
 
 ## TypeScript 生态
 
+> ✅ v1 实际：文件系统用 Node.js 原生 `fs`；向量用内存实现（InMemoryVectorStore）；LLM/Embedding 走火山引擎 OpenAI 兼容 HTTP API（`LLMProvider` / `EmbeddingProvider` 接口，配置切换）。
+
+v2 目标：
 - PostgreSQL：`pg` / Prisma / Drizzle ORM
 - pgvector：`pgvector` npm 包
 - 文件系统：Node.js 原生 `fs/promises`

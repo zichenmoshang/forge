@@ -82,6 +82,10 @@ function buildConfigFromEnv(): Record<string, unknown> {
       appId: env('FEISHU_APP_ID'),
       appSecret: env('FEISHU_APP_SECRET'),
       wikiSpaceIds: env('FEISHU_WIKI_SPACE_IDS'),
+      syncEnabled: env('FEISHU_SYNC_ENABLED'),
+      chunkMaxChars: env('FEISHU_CHUNK_MAX_CHARS'),
+      chunkOverlapChars: env('FEISHU_CHUNK_OVERLAP_CHARS'),
+      projectScope: env('FEISHU_PROJECT_SCOPE'),
     },
   };
 }

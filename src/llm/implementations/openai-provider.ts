@@ -32,6 +32,8 @@ export class OpenAIProvider implements LLMProvider {
     this.client = new OpenAI({
       apiKey: config.apiKey,
       baseURL: config.baseUrl || undefined,
+      // 大输出量场景（故事拆解、技术方案）可能需要较长生成时间，设置 30 分钟超时
+      timeout: 30 * 60 * 1000,
     });
   }
 
@@ -77,6 +79,7 @@ export class OpenAIProvider implements LLMProvider {
           totalTokens: result.totalTokens,
           durationMs,
           success: true,
+          finishReason: result.finishReason,
         });
 
         return result;

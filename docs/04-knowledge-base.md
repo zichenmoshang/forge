@@ -29,7 +29,7 @@
 | 高频代码模式 | 全量代码扫描归纳 | 列表页通用写法、表单通用写法 | ✅ | - |
 | 历史澄清问题 | 已完成需求的澄清日志 | 澄清问题、回答、所属功能模块 | ❌ | ✅ |
 | 历史故事集 | 已完成需求的用户故事 | 故事结构、AC 写法、依赖关系 | ❌ | ✅ |
-| 技术文档 wiki | 飞书文档 | 团队技术规范、架构决策、最佳实践、技术选型 | ❌ | ✅ |
+| 技术文档 wiki | 飞书文档 | 团队技术规范、架构决策、最佳实践、技术选型 | ✅ | - |
 | 全局需求清单 | 团队维护的标准全局需求 | 登录、权限、错误处理、埋点等标准项 | ❌ | ✅ |
 
 ## 知识库在各阶段的使用方式
@@ -208,22 +208,33 @@ Top N 结果（通常 5-10 条）
 | OpenAI text-embedding-3-small | 1536 | 8191 | ⭐⭐⭐ 中等 | API only | ~¥0.15 | 稳定、生态好、便宜 | 中文弱、需代理 |
 | OpenAI text-embedding-3-large | 3072 | 8191 | ⭐⭐⭐⭐ 较好 | API only | ~¥0.95 | 精度高、MRL灵活 | 贵、中文仍不如国产、需代理 |
 
-### 选型决策：通义 Qwen3-Embedding（API 版，1024 维）
+### 选型决策：火山引擎 Doubao-embedding-vision（多模态 API 版，2048 维）
+
+**当前配置**：
+- Provider：OpenAI 兼容格式（`EMBEDDING_PROVIDER=openai`）
+- Base URL：`https://ark.cn-beijing.volces.com/api/v3`
+- 模型：`doubao-embedding-vision-251215`（多模态向量化模型）
+- 维度：2048
+- API 端点：`/embeddings/multimodal`（多模态模型专用，不支持标准 `/embeddings`）
 
 **选择理由**：
-1. **中文效果最新 SOTA**：2026 年发布的 Qwen3-Embedding 在 CMTEB（中文多任务嵌入基准）上排名前列
-2. **32K 超长上下文**：技术方案文档不需要切太碎，保留完整上下文，检索更准确
-3. **1024 维度**：pgvector 的甜点区，HNSW 索引性能好，存储成本合理
-4. **国内访问稳定**：阿里云 API，不需要代理，团队级服务可靠性高
-5. **成本低**：约 ¥0.7/百万 token，团队知识库全量重建一次成本极低
-6. **有开源版**：后续如果不想依赖 API，可以用开源版本地部署，迁移成本低
+1. **与 LLM 同平台**：与 Doubao-Seed-Evolving 大模型共用火山引擎方舟平台，减少跨平台依赖和运维成本
+2. **中文效果优秀**：豆包系列模型在中文语义理解上表现优异，适合技术文档检索场景
+3. **多模态能力**：支持文本和图片向量化，未来可扩展设计稿（Figma 截图）等多模态知识检索
+4. **API Key 复用**：与 LLM 共用同一个 API Key，配置简单
+5. **2048 维度**：多模态模型默认输出维度，语义表达能力更强
+6. **国内访问稳定**：火山引擎国内节点，延迟低，不需要代理
 
-**pgvector 维度选择 1024 的理由**：
-- 1024 维是 pgvector 的甜点区，HNSW 索引性能好，区分度足够
-- 3072 维存储和计算成本翻倍，pgvector 延迟明显增加
-- 512 维区分度不够，中文场景召回率下降 10-15%
+**多模态 API 适配说明**：
+- 火山引擎 `doubao-embedding-vision` 系列模型仅支持 `/embeddings/multimodal` 端点，不支持标准 `/embeddings` 端点
+- 请求体格式：`{ model, input: [{ type: 'text', text: '...' }] }`
+- 响应体格式：`{ data: { embedding: [...], object: 'embedding' } }`（data 是单个对象，不是数组）
+- `OpenAIEmbeddingProvider` 已自动适配：模型名包含 `vision` 时自动切换到多模态端点和请求/响应格式
 
-**备选方案**：如果团队有 GPU 服务器且不想依赖外部 API，可切换为 BGE-M3 本地部署，额外优势是支持稀疏向量检索，可减少对 BM25 的依赖。
+**可替换性**：
+- EmbeddingProvider 设计为可插拔，当前支持 `qwen`（阿里云）、`openai`（OpenAI 兼容，含火山引擎）、`mock`（测试用）
+- 切换模型只需修改 `.env` 配置，无需改代码
+- 备选方案：Qwen3-Embedding（阿里云，中文 SOTA，32K 超长上下文）、BGE-M3（开源本地部署，支持混合检索）
 
 ## 维护机制
 
@@ -233,29 +244,48 @@ Top N 结果（通常 5-10 条）
 知识来源                    采集方式              解析方式
 ─────────────────────────────────────────────────────────
 代码仓库（main分支）    →  webhook 触发/定时拉取  →  AST 反解析
-飞书文档 wiki（v2）     →  API 定时同步          →  Markdown 解析 + 标题层级提取
+飞书文档 wiki            →  API 手动同步/定时同步   →  raw_content 纯文本 + 标题层级分块
 历史 PR/方案文档        →  API 拉取               →  文本提取 + 元数据关联
 人工录入（可选）        →  管理界面/CLI           →  结构化表单
                               ↓
                     质量校验（规则校验 + 交叉验证）
                               ↓
-                    向量化（Qwen3-Embedding，1024 维）
+                    向量化（Doubao-embedding-vision，2048 维，多模态 API）
                               ↓
-                    入库（PostgreSQL + pgvector）
+                    入库（InMemoryVectorStore，v2 切换 pgvector）
                               ↓
-                    索引构建（关键词索引 + 向量索引 + 元数据索引）
+                    索引构建（向量索引 + 元数据索引）
 ```
 
-### 飞书文档同步（v2）
+### 飞书文档同步（已实现）
 
 技术文档 wiki 使用**飞书文档**，同步方式：
 
-1. **配置飞书应用**：创建飞书自建应用，获取文档读取权限
-2. **配置文档目录**：指定需要同步的飞书知识库/文件夹，支持增量同步
-3. **定时同步**：每天一次全量同步，检测文档变更
-4. **解析方式**：飞书文档 API 获取内容，按标题层级切分 chunk，标题路径作为天然标签（如"前端规范 > 代码风格 > 命名规范"）
-5. **变更检测**：对比文档版本号，只重新解析变更的文档
-6. **与代码交叉验证**：文档中提到的接口/组件，如果代码中不存在，标记"文档可能过时"
+1. **配置飞书应用**：创建飞书自建应用，获取文档读取权限（`FEISHU_APP_ID` + `FEISHU_APP_SECRET`）
+2. **配置文档目录**：指定需要同步的飞书知识库空间 ID（`FEISHU_WIKI_SPACE_IDS`，逗号分隔多个空间）
+3. **手动同步**：`forge kb sync-feishu` 命令触发全量同步，v2 支持定时同步
+4. **解析方式**：飞书文档 API 获取 raw_content 纯文本，按标题层级→段落→字符三级切分 chunk，支持重叠和小块合并
+5. **文档类型支持**：Docx（新版，obj_type=22）和 Doc（旧版，obj_type=2），自动跳过 Folder/Sheet/Bitable 等非文档节点
+6. **项目范围隔离**：同步时可指定 `--scope <project-id>`，默认 `global`，支持团队级通用知识和项目级特定知识
+7. **分块配置**：`FEISHU_CHUNK_MAX_CHARS`（默认 1000）、`FEISHU_CHUNK_OVERLAP_CHARS`（默认 100）
+
+**同步流程**：
+```
+飞书 Wiki 空间
+  → 获取所有节点（递归遍历子节点，分页）
+  → 筛选文档节点（Doc + Docx）
+  → 逐个获取文档纯文本内容（raw_content API）
+  → 文档分块（DocChunker：标题→段落→字符三级切分）
+  → 构造 KnowledgeDocument（type=doc, source=feishu）
+  → 调用 KnowledgeService.indexDocument 入库
+  → 向量化 + InMemoryVectorStore 存储
+```
+
+**v2 扩展方向**：
+- 增量同步：基于文档更新时间，只同步变更的文档
+- 定时同步：每天一次全量同步
+- 与代码交叉验证：文档中提到的接口/组件，如果代码中不存在，标记"文档可能过时"
+- blocks API 结构化解析：当前用 raw_content 纯文本，v2 可用 blocks API 提取代码块、表格等结构化内容
 
 ### 各知识类型的维护策略
 
@@ -266,7 +296,7 @@ Top N 结果（通常 5-10 条）
 | 数据模型 | 中 | 增量：类型文件变更时重新解析 | 字段完整性校验 |
 | 技术方案 | 低（PR 合并时） | 增量：新 PR 合并时入库 | 必须经过评审的 PR 才入库 |
 | 代码规范 | 低 | 全量：规范文档变更时重建 | 人工审核 + 规则校验 |
-| 飞书文档 wiki | 中 | 定时同步（每天一次） | 与代码交叉验证，标记"可能过时" |
+| 飞书文档 wiki | 中 | 手动同步（`forge kb sync-feishu`），v2 定时同步 | 与代码交叉验证，标记"可能过时"（v2） |
 | 历史澄清问题 | 低（需求冻结时） | 增量：每个需求完成后入库 | 需求评审通过的才入库 |
 
 ### 增量更新机制
@@ -327,7 +357,8 @@ Top N 结果（通常 5-10 条）
 | 工具 | 命令 | 用途 | 使用者 |
 |---|---|---|---|
 | 全量重建 | `forge kb rebuild` | 全量重新解析代码和文档，重建向量索引 | 开发/运维 |
-| 增量同步 | `forge kb sync` | 同步最新代码变更和飞书文档 | 定时任务/CI |
+| 增量同步 | `forge kb sync` | 同步最新代码变更 | 定时任务/CI |
+| 飞书同步 | `forge kb sync-feishu` | 同步飞书 Wiki 文档到知识库 | 开发/运维 |
 | 知识检索 | `forge kb search "关键词"` | 手动检索验证效果 | 开发 |
 | 知识状态 | `forge kb status` | 查看知识库统计（总数、各类型数量、过期数） | 开发 |
 | 管理界面（v2） | Web UI | 查看知识列表、手动标记/删除、查看权重 | 管理员 |
@@ -346,7 +377,7 @@ Top N 结果（通常 5-10 条）
 ### v1（当前版本）
 
 - ✅ 代码反解析（API、组件；数据模型/技术方案/规范/异常模式/高频模式待扩展）
-- ✅ 向量语义检索（InMemoryVectorStore + Qwen3-Embedding 1024 维，pgvector 持久化待实现）
+- ✅ 向量语义检索（InMemoryVectorStore + Doubao-embedding-vision 2048 维多模态 API，pgvector 持久化待实现）
 - ✅ 元数据过滤（类型/来源/项目范围/技术栈/权重）
 - ✅ 增量更新接口（syncIncremental，webhook 触发待接入）
 - ⏳ 技术方案设计阶段使用知识库（4 路并行检索：API/组件/方案/规范，随 DesignAgent 实现落地，ADR-014 后由 Agent 内部检索）
@@ -356,7 +387,7 @@ Top N 结果（通常 5-10 条）
 - ❌ BM25 关键词精确检索 — 当前只有向量检索，v1.5 可补充
 - ❌ pgvector 持久化 — 当前内存版，重启后数据丢失
 - ❌ Rerank（LLM 二次筛选）— 先用 top N 直接注入
-- ❌ 飞书文档同步 — 技术文档 wiki 暂不接入
+- ✅ 飞书文档同步 — FeishuClient + DocChunker + FeishuSyncService，支持 Docx/Doc、多级分块、多空间、项目范围隔离
 - ❌ 需求澄清阶段使用知识库 — v1 澄清问题仅基于 PRD 生成
 - ❌ 故事拆解阶段使用知识库 — v1 故事拆解仅基于结构化需求
 - ❌ 历史澄清问题/故事集入库 — 需求完成后暂不自动入库
@@ -366,7 +397,7 @@ Top N 结果（通常 5-10 条）
 
 ### v2（计划版本）
 
-- 飞书文档 wiki 同步
+- 飞书文档增量同步 + 定时同步
 - Rerank（LLM 二次筛选）
 - 需求澄清阶段使用知识库（历史澄清问题 + 全局需求清单）
 - 故事拆解阶段使用知识库（历史故事结构 + AC 模式）
@@ -388,17 +419,17 @@ Top N 结果（通常 5-10 条）
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | 知识库类型定义 | ✅ 已完成 | KnowledgeItem/KnowledgeFilter/KnowledgeStatus/KnowledgeDocument |
-| 向量模型接入（Qwen3） | ✅ 已完成 | QwenEmbeddingProvider + MockEmbeddingProvider + 工厂方法 |
+| 向量模型接入（火山 Doubao-embedding-vision） | ✅ 已完成 | OpenAIEmbeddingProvider（多模态 API 适配）+ MockEmbeddingProvider + 工厂方法 |
 | 向量存储 | ✅ 内存版完成 | InMemoryVectorStore（余弦相似度+元数据过滤），pgvector 版待实现 |
 | 代码反解析（AST） | ✅ 已完成 | TypeScript Compiler API，提取 API 接口和组件 props |
 | 知识库检索服务 | ✅ 已完成 | KnowledgeService 单例，search/indexCode/indexDocument/getStatus/updateWeight/rebuild |
 | BaseAgent 检索钩子 | ✅ 已完成 | retrieveKnowledge 钩子 + searchKnowledge helper（多路并行/projectScope/去重），buildUserPrompt 注入知识 |
 | ContextManager 知识装配 | ➖ 已移除（ADR-014） | 检索职责收归 Agent，ContextManager 只做产物装配（同步、无知识库调用） |
 | Harness 知识集成 | ✅ 已完成 | HarnessConfig 传入 knowledgeService，经 AgentContext 注入给 Agent |
-| 维护 CLI | ✅ 已完成 | kb sync/rebuild/search/status 四个命令 |
-| 单元测试 | ✅ 已完成 | 57 个知识库相关测试 |
+| 维护 CLI | ✅ 已完成 | kb sync/rebuild/search/status/sync-feishu 五个命令 |
+| 单元测试 | ✅ 已完成 | 87 个知识库相关测试（含飞书同步 30 个） |
 | BM25 关键词检索 | ❌ v1 未实现 | 当前只有向量检索，v1.5 可补充简单关键词匹配 |
 | pgvector 持久化 | ❌ 待实现 | 当前内存版，v1 验证后切换 |
-| 飞书文档同步 | ⏳ v2 | 依赖飞书 API 接入 |
+| 飞书文档同步 | ✅ 已完成 | FeishuClient + DocChunker + FeishuSyncService，支持 Docx/Doc、多级分块、多空间 |
 | Rerank | ⏳ v2 | LLM 二次筛选 |
 | 需求澄清/故事拆解阶段知识注入 | ⏳ v2 | v1 只做技术方案设计阶段 |

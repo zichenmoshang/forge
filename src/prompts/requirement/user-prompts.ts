@@ -81,48 +81,26 @@ ${rules}
 非功能需求：
 ${nfrs}
 
-请按以下结构输出 JSON：
+请按以下结构输出 JSON（只输出 stories，不要其他字段）：
 {
   "stories": [{
-    "id": "",
-    "title": "",
-    "description": { "role": "", "action": "", "benefit": "" },
-    "acceptanceCriteria": [{
-      "id": "",
-      "given": [],
-      "when": "",
-      "then": [],
-      "scenarioType": "normal|exception|boundary|permission",
-      "testable": true
-    }],
+    "id": "s1",
+    "title": "简短标题",
+    "description": { "role": "用户角色", "action": "想要做什么", "benefit": "获得什么价值" },
+    "acceptanceCriteria": [
+      "正常场景：给定...当...则...",
+      "异常/边界场景：给定...当...则..."
+    ],
     "priority": "P0|P1|P2",
-    "dependencies": [],
-    "relatedFeatureIds": [],
-    "relatedRuleIds": [],
-    "type": "feature|bugfix|enhancement|technical|non-functional",
-    "hasExceptionFlow": false
-  }],
-  "storyMap": [{ "groupName": "", "description": "", "storyIds": [], "order": 0 }],
-  "nfrMapping": [{ "nfrId": "", "storyIds": [], "implementationNote": "", "requiresDesignAttention": false }],
-  "qualityCheck": {
-    "invest": {
-      "independent": true,
-      "negotiable": true,
-      "valuable": true,
-      "estimable": true
-    }
-  }
+    "relatedFeatureIds": ["f1"],
+    "type": "feature|bugfix|enhancement|technical|non-functional"
+  }]
 }
 
-其中 qualityCheck.invest 请按 INVEST 原则对整组故事做自评估（small/testable 由系统自动计算，无需输出）：
-- independent：故事之间是否可独立交付（无不合理的强耦合）
-- negotiable：故事是否是可协商的需求描述而非写死的实现
-- valuable：每个故事是否对用户/业务有明确价值
-- estimable：故事是否可估算工作量（范围清晰）
-不满足时对应字段填 false，不得一律填 true。
-
 注意：
-- 每个故事至少有 2 条验收标准（1 条正常 + 1 条异常/边界）
-- 故事之间的依赖关系要明确
-- 故事地图按用户旅程排序`;
+- 每个故事**恰好 2 条**验收标准（1 条正常 + 1 条异常/边界），不要多也不要少
+- 验收标准用简洁的自然语言描述（Given/When/Then 格式），不要嵌套结构
+- description 的 action/benefit 各 1 句话，不要冗长
+- 只输出 stories 数组，不要输出 storyMap、nfrMapping、qualityCheck 等其他字段
+- 输出简洁，避免冗余描述`;
 }

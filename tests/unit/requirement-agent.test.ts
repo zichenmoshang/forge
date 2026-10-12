@@ -407,11 +407,12 @@ describe('RequirementAgent', () => {
       expect(result.errors.some((e) => e.code === 'MISSING_EXCEPTION_AC')).toBe(true);
     });
 
-    it('#5 INVEST 的 I/N/V/E 采纳 LLM 自评，Small/Testable 由程序计算', async () => {
+    it('#5 INVEST 全部由程序计算（不再采纳 LLM 自评）', async () => {
+      // 即使 LLM 输出了 qualityCheck.invest，也会被程序计算结果覆盖
       const json = JSON.stringify({
         ...JSON.parse(STORY_JSON),
         qualityCheck: {
-          invest: { independent: false, negotiable: true, valuable: true, estimable: true },
+          invest: { independent: false, negotiable: false, valuable: false, estimable: false, small: false, testable: false },
         },
       });
       const llm = createMockLLM(json);
@@ -424,10 +425,14 @@ describe('RequirementAgent', () => {
       });
 
       const stories = result.data as import('../../src/types/user-story').UserStorySet;
-      expect(stories.qualityCheck.invest.independent).toBe(false); // 采纳 LLM 自评
-      expect(stories.qualityCheck.invest.small).toBe(true); // 程序计算
-      expect(stories.qualityCheck.invest.testable).toBe(true); // 程序计算
-      expect(stories.qualityCheck.passed).toBe(false); // independent=false 拉低整体
+      // 全部由程序计算，不采纳 LLM 自评
+      expect(stories.qualityCheck.invest.independent).toBe(true); // 程序计算：无 dependencies
+      expect(stories.qualityCheck.invest.negotiable).toBe(true); // 程序无法判断，默认通过
+      expect(stories.qualityCheck.invest.valuable).toBe(true); // 程序计算：benefit 非空
+      expect(stories.qualityCheck.invest.estimable).toBe(true); // 程序计算：有 AC
+      expect(stories.qualityCheck.invest.small).toBe(true); // 程序计算：AC 数 <= 5
+      expect(stories.qualityCheck.invest.testable).toBe(true); // 程序计算：所有 AC 可测试
+      expect(stories.qualityCheck.passed).toBe(true); // 全部通过
     });
 
     it('#5 LLM 谎称 small=true 时被程序计算结果覆盖', async () => {

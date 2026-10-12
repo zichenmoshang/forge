@@ -92,6 +92,8 @@ interface RawRevision {
   changedSections?: string[];
   issueResponses?: IssueResponse[];
   updatedDesign?: RawDesign;
+  /** 增量模式：只包含有变更的字段，未包含的字段沿用上一版 */
+  updates?: Partial<RawDesign>;
 }
 
 export class DesignAgent extends BaseAgent<DesignAgentInput, FrontendDesignDoc> {
@@ -174,7 +176,7 @@ export class DesignAgent extends BaseAgent<DesignAgentInput, FrontendDesignDoc> 
 
   protected parseOutput(content: string, input: DesignAgentInput): FrontendDesignDoc {
     const jsonStr = this.extractJsonObject(content);
-    const parsed: RawDesign = JSON.parse(jsonStr);
+    const parsed = this.parseJsonWithRecovery<RawDesign>(jsonStr);
     const now = new Date().toISOString();
 
     return this.normalizeDesignDoc(
@@ -286,35 +288,36 @@ export class DesignAgent extends BaseAgent<DesignAgentInput, FrontendDesignDoc> 
     if (!output.stateManagement.principle) {
       errors.push({
         code: 'NO_STATE_MANAGEMENT_PRINCIPLE',
-        message: '必须明确全局状态与局部状态的划分原则（stateManagement.principle）',
-        severity: 'error',
+        message: '缺少全局状态与局部状态的划分原则（stateManagement.principle），需在评审/编码阶段补充',
+        severity: 'warning',
       });
     }
 
     const componentIds = new Set(output.componentTree.map((c) => c.id));
     const storyIds = new Set(stories.stories.map((s) => s.id));
 
-    // 引用完整性：页面引用的组件必须存在
+    // 引用完整性：页面引用的组件必须存在（warning：LLM 一次性输出难以完全自洽，
+    // 缺失引用允许在评审/编码阶段补全，不再阻断流程，见 issue #81）
     for (const page of output.pages) {
       for (const cid of page.componentIds ?? []) {
         if (!componentIds.has(cid)) {
           errors.push({
             code: 'BROKEN_COMPONENT_REF',
             message: `页面 ${page.id} 引用了不存在的组件 ${cid}`,
-            severity: 'error',
+            severity: 'warning',
             field: `pages.${page.id}.componentIds`,
           });
         }
       }
     }
-    // 组件 children 引用必须存在
+    // 组件 children 引用必须存在（同上，warning 不阻断）
     for (const comp of output.componentTree) {
       for (const childId of comp.children ?? []) {
         if (!componentIds.has(childId)) {
           errors.push({
             code: 'BROKEN_CHILD_REF',
             message: `组件 ${comp.id} 的 children 引用了不存在的组件 ${childId}`,
-            severity: 'error',
+            severity: 'warning',
             field: `componentTree.${comp.id}.children`,
           });
         }
@@ -430,25 +433,62 @@ export class DesignAgent extends BaseAgent<DesignAgentInput, FrontendDesignDoc> 
 
   private parseRevise(content: string, input: DesignReviseInput): DesignRevision {
     const jsonStr = this.extractJsonObject(content);
-    const parsed: RawRevision = JSON.parse(jsonStr);
+    const parsed = this.parseJsonWithRecovery<RawRevision>(jsonStr);
     const now = new Date().toISOString();
     const prev = input.previousDesign;
 
-    const rawUpdated = parsed.updatedDesign ?? {};
-    const updatedDesign = this.normalizeDesignDoc(
-      rawUpdated,
-      {
-        // 沿用原方案 id 与关联，版本 +1（评审内修改不是回退，ADR-014）
-        id: prev.id,
-        requirementId: prev.requirementId,
-        storySetId: prev.storySetId,
-        version: prev.version + 1,
-      },
-      input.stories,
-      now,
-    );
-    // 保留首次创建时间
-    updatedDesign.createdAt = prev.createdAt;
+    let updatedDesign: FrontendDesignDoc;
+
+    if (parsed.updatedDesign && Object.keys(parsed.updatedDesign).length > 0) {
+      // 兼容全量输出：LLM 输出了完整的 updatedDesign，用 normalizeDesignDoc 处理
+      const rawUpdated = parsed.updatedDesign;
+      updatedDesign = this.normalizeDesignDoc(
+        rawUpdated,
+        {
+          id: prev.id,
+          requirementId: prev.requirementId,
+          storySetId: prev.storySetId,
+          version: prev.version + 1,
+        },
+        input.stories,
+        now,
+      );
+      updatedDesign.createdAt = prev.createdAt;
+    } else {
+      // 增量模式：深拷贝 previousDesign，合并 updates 中的变更字段
+      updatedDesign = JSON.parse(JSON.stringify(prev)) as FrontendDesignDoc;
+      updatedDesign.version = prev.version + 1;
+      updatedDesign.updatedAt = now;
+
+      if (parsed.updates && typeof parsed.updates === 'object') {
+        const updatableFields = [
+          'techStack', 'figmaReference', 'pages', 'componentTree',
+          'stateManagement', 'dataModels', 'apiContracts',
+          'exceptionScenarios', 'nfrSolutions', 'reusableComponents',
+          'directoryStructure',
+        ] as const;
+        for (const field of updatableFields) {
+          if (parsed.updates[field] !== undefined) {
+            (updatedDesign as unknown as Record<string, unknown>)[field] = parsed.updates[field];
+          }
+        }
+      }
+
+      // 增量合并后需要重算覆盖度等元数据
+      const recalculated = this.normalizeDesignDoc(
+        updatedDesign as unknown as RawDesign,
+        {
+          id: prev.id,
+          requirementId: prev.requirementId,
+          storySetId: prev.storySetId,
+          version: prev.version + 1,
+        },
+        input.stories,
+        now,
+      );
+      recalculated.createdAt = prev.createdAt;
+      updatedDesign = recalculated;
+    }
 
     return {
       changeSummary: parsed.changeSummary ?? '',

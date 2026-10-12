@@ -176,11 +176,15 @@ Agent 之下是统一的基础设施层，所有 Agent 通过这层访问外部�
 │  · Git 操作                              │
 │  · 文件读写                              │
 ├─────────────────────────────────────────┤
-│           存储层                         │
+│           存储层（目标态）                │
 │  · PostgreSQL（状态/元数据/索引）         │
 │  · pgvector（向量索引）                  │
 │  · 文件系统（产物内容/日志/临时文件）      │
 └─────────────────────────────────────────┘
+
+> ⚠️ **实现状态**：v1 存储层为「本地文件系统 + 内存向量库」——产物/状态/日志落盘
+> `data/instances/{id}/`（FileSystemArtifactStore + `state.json` 快照，#82 已实现，`--resume` 恢复），
+> 向量为 InMemoryVectorStore（#84 前置：重启丢失，pgvector 持久化为 v2 目标）。
 ```
 
 ### LLM Provider 层
@@ -361,11 +365,12 @@ interface AgentContext {
 
 ### VectorStore（统一向量操作）
 
-知识库向量和代码索引向量**共用同一个 pgvector 实例，分表存储**：
-- `knowledge_items` 表：团队级知识库
-- `code_symbols` 表：项目级代码索引
+知识库向量和代码索引向量**共用同一个 VectorStore，按命名空间隔离**（目标态：pgvector 分表）：
+- `knowledge_items`：团队级知识库
+- `code_symbols`：项目级代码索引
 
-VectorStore 提供通用的向量操作（upsert、search、delete），KnowledgeService 和 CodeIndexService 都调用 VectorStore，但操作不同的表。
+> ⚠️ **实现状态**：v1 为 `InMemoryVectorStore`（余弦相似度 + 元数据过滤，进程内存储），
+> 接口（upsert/search/delete）与 pgvector 目标一致，v2 切换实现无需改调用方。
 
 ### 知识库维护独立流程
 
@@ -383,13 +388,13 @@ forge kb status    # 查看知识库统计
 ### v1 范围
 
 v1 需要实现知识库基础设施，用于验证 Harness 和 DesignAgent 的正确性：
-- ✅ KnowledgeService 核心接口（search、indexCode、getStatus）
-- ✅ VectorStore（pgvector 操作）
+- ✅ KnowledgeService 核心接口（search、indexCode、getStatus，单例）
+- ✅ VectorStore（v1 为 InMemoryVectorStore，pgvector 持久化为 v2 目标）
 - ✅ ASTParser（代码反解析，至少支持 API 和组件提取）
 - ✅ BaseAgent retrieveKnowledge 钩子 + searchKnowledge 多路检索 helper（ADR-014）
 - ✅ DesignAgent 内部三路并行检索（组件/模式、API/模型、规范/异常，随方案生成落地）
 - ✅ 知识库维护 CLI（sync/rebuild/search/status）
-- ❌ 飞书文档同步（v2）
+- ✅ 飞书文档同步（FeishuSyncService，全量+增量、自动同步+手动全量；v1 已落地，见 docs/04-knowledge-base.md）
 - ❌ Rerank（v2，v1 用 top K 直接注入）
 - ❌ RequirementAgent 知识库检索（v2）
 - ❌ 权重反馈闭环（v2，v1 权重只有初始值）
@@ -428,13 +433,14 @@ v1 需要实现知识库基础设施，用于验证 Harness 和 DesignAgent 的�
    - ~~知识库基础设施（KnowledgeService + VectorStore + EmbeddingProvider + ASTParser + CLI）~~ ✅ 已完成
    - [ ] Tracer / Metrics（按需补充）
    - [ ] Tool Layer（代码执行、Figma、Git；知识库检索不走 Tool，通过服务层注入）
-   - [ ] 存储层（PostgreSQL + pgvector 持久化，当前内存版）
+   - [~] 存储层：✅ 产物/状态文件持久化（#82：FileSystemArtifactStore + state.json 快照 + --resume）；
+   ⏳ PostgreSQL + pgvector 持久化（当前内存向量版，v2 目标）
 3. ~~实现 Agent 基类（模板方法模式 + retrieveKnowledge 钩子）~~ ✅ 已完成
 4. 逐个实现专业 Agent
    - ~~需求分析 Agent（澄清+故事拆解+多轮 followup）~~ ✅ 已完成
    - ~~方案设计 Agent（结合知识库多次检索 + 评审内 revise）~~ ✅ 已完成
    - [~] 评审 Agent：✅ 方案评审多轮已完成；⏳ 代码 CR 随 CodingAgent 落地
-   - [~] 编码 Agent：✅ 单故事 TDD（red/green/fix）+ 逐故事循环与部分成功出口 + CR 内 revise（针对性修改+重跑测试）；⏳ 真实子进程 runner v2
+   - [~] 编码 Agent：✅ 单故事 TDD（red/green/fix）+ 逐故事循环与部分成功出口 + CR 内 revise（针对性修改+重跑测试）；✅ 真实子进程 runner（#83：LocalSubprocessTestRunner，CLI 默认，失败降级静态）
    - [~] 评审 Agent：✅ 方案评审多轮（review-design + Designer revise）+ 代码 CR 多轮（review-code + Coder revise）；⏳ 设计还原度图片比对 v2
    - [ ] 交付 Agent（PR）
 5. ~~实现 Harness（状态机执行器 + 调度 + 上下文装配 + 异常 + 弱介入 + 回退 + 取消 + 知识库服务注入）~~ ✅ 已完成（ADR-014：ContextManager 只做产物装配，检索收归 Agent）

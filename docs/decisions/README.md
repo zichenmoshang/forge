@@ -85,6 +85,10 @@
 
 v1 用 PostgreSQL（状态/元数据/索引）+ pgvector（向量）+ 本地文件系统（大文本/代码/日志）三件套。
 
+> ⚠️ **实践变更（#85 同步）**：落地时 v1 存储收敛为「本地文件系统 + 内存向量库」——
+> 产物/状态/日志落盘 `data/instances/{id}/`（FileSystemArtifactStore + state.json 快照，#82），
+> 向量为 InMemoryVectorStore（#84），PostgreSQL + pgvector 推迟为 v2 目标，本 ADR 的选型理由在 v2 落地时继续适用。
+
 ### 理由
 
 - 运维成本最低，不引入额外组件
@@ -265,6 +269,10 @@ INIT, REQUIREMENT_PARSING, REQUIREMENT_CLARIFICATION, STORIES_GENERATING, DESIGN
    - 有开源版，后续可本地部署，迁移成本低
    - 备选：BGE-M3 本地部署（有 GPU 时可切换，支持稀疏向量混合检索）
 
+   > ⚠️ **实践变更（#85 同步）**：实际接入改为 **火山引擎 Doubao-embedding-vision-251215**
+   > （多模态 API，`/embeddings/multimodal` 端点，2048 维，OpenAI 兼容，API Key 复用主模型）。
+   > 选型理由与对比见 docs/04-knowledge-base.md「选型决策」节；Qwen3/BGE-M3 仍为可切换备选。
+
 3. **混合检索架构**：关键词精确检索（BM25）+ 向量语义检索（pgvector）+ 元数据过滤，v2 增加 Rerank（LLM 二次筛选）。
 
 4. **查询时动态增强**：LLM 根据当前任务动态构造多检索 query，多路并行检索，合并去重后注入 prompt。
@@ -275,7 +283,7 @@ INIT, REQUIREMENT_PARSING, REQUIREMENT_CLARIFICATION, STORIES_GENERATING, DESIGN
    - 技术方案设计（v1）：API 复用 + 组件复用 + 方案参考 + 规范约束，核心输入
 
 6. **维护机制**：
-   - 代码反解析为主（AST 提取），飞书文档同步为辅（v2）
+   - 代码反解析为主（AST 提取），飞书文档同步为辅（✅ 已提前落地：FeishuSyncService，全量+增量同步，见 docs/04-knowledge-base.md）
    - 增量更新（webhook 触发）+ 手动全量重建兜底
    - 五层质量保证：来源过滤、交叉验证、规则校验、使用反馈、过期检测
    - 动态权重系统（0-1），影响检索排序
@@ -284,8 +292,8 @@ INIT, REQUIREMENT_PARSING, REQUIREMENT_CLARIFICATION, STORIES_GENERATING, DESIGN
 7. **飞书文档集成（v2）**：技术文档 wiki 使用飞书文档，通过飞书 API 定时同步，按标题层级切分 chunk，与代码交叉验证标记过时。
 
 8. **v1/v2 范围划分**：
-   - v1：代码反解析 + 向量检索 + 关键词检索 + 技术方案设计阶段使用 + 维护 CLI
-   - v2：飞书文档同步 + Rerank + 澄清/故事阶段使用 + 需求完成后自动入库 + 权重反馈闭环 + 管理界面
+   - v1：代码反解析 + 向量检索 + 关键词检索 + 技术方案设计阶段使用 + 维护 CLI + 飞书文档同步（提前落地）
+   - v2：Rerank + 澄清/故事阶段使用 + 需求完成后自动入库 + 权重反馈闭环 + 管理界面
 
 ### 备选方案
 

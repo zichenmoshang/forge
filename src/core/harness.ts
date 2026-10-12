@@ -1,12 +1,17 @@
 /**
- * Harness 主类 - 状态机执行器与 Agent 调度器
+ * Harness 主类（门面）- 状态机执行器与 Agent 调度器（issue #47 拆分瘦身）
  *
- * 职责：
- * - 维护全局状态机
- * - 根据当前状态调度对应 Agent
- * - 管理产物存储
- * - 处理硬卡点（人工介入等待）
- * - 异常处理与兜底
+ * 拆分后职责：
+ * - 生命周期与状态机：构造、start、resume、fallback、cancel、continueFromSnapshot
+ * - 主执行循环（runExecutionLoop）：按当前状态分发到 评审 Runner / 编码 Runner / 通用 Agent 执行
+ * - 硬卡点等待与人工介入回调
+ * - 状态持久化（#82）：state.json 快照 + --resume 恢复
+ *
+ * 已拆出的子模块（行为不变，#47 纯重构）：
+ * - ReviewDialogRunner（src/core/review-dialog.ts）：方案评审/代码 CR 多轮对话
+ * - CodingPhaseRunner（src/core/coding-phase.ts）：逐故事 TDD 编排
+ * - state-transitions.ts：状态→阶段/Agent/下一状态 纯函数
+ * - human-interaction.ts：硬卡点提问/回答/弱介入 纯逻辑
  */
 
 import {
@@ -17,7 +22,28 @@ import {
 } from './state-machine';
 import { InMemoryArtifactStore } from './artifact-store';
 import type { ArtifactStore } from './artifact-store';
+import {
+  FileSystemArtifactStore,
+  loadStateSnapshot,
+  saveStateSnapshot,
+  isTerminalSnapshot,
+} from './state-snapshot';
+import * as path from 'path';
 import { ContextManager } from './context-manager';
+import { ReviewDialogRunner } from './review-dialog';
+import { CodingPhaseRunner } from './coding-phase';
+import {
+  getNextState,
+  getNextStateAfterBlocking,
+  getAgentForState,
+  getArtifactStage,
+  stateToStage,
+} from './state-transitions';
+import {
+  buildBlockingQuestion,
+  handleHumanAnswer,
+  invokeWeakIntervention,
+} from './human-interaction';
 import type { BaseAgent } from '../agents/base';
 import type { AgentContext, AgentResult, GlobalContext } from '../agents/types';
 import type { RequirementAgent } from '../agents/requirement-agent';
@@ -25,25 +51,9 @@ import type { DesignAgent } from '../agents/design-agent';
 import type { CodingAgent } from '../agents/coding-agent';
 import type { PipelineState, PipelineStateName, ArtifactStage } from '../types/state';
 import type { StructuredRequirement } from '../types/requirement';
-import type { UserStorySet } from '../types/user-story';
-import type { FrontendDesignDoc } from '../types/frontend-design';
-import type {
-  CodingPhaseResult,
-  CodingResult,
-  CodingTask,
-  ProjectContext,
-  TestRequirements,
-} from '../types/coding-task';
-import { topoSortStories, aggregateCodingResults, hasAnySuccessStory } from './coding-aggregator';
-import type { ReviewResult, ReviewIssue } from '../types/review-and-delivery';
-import type {
-  DesignRevision,
-  ReviewDialogHistory,
-  DialogMessage,
-  IssueResponse,
-} from '../types/review-dialog';
-import type { CodeReviewInput } from '../agents/review-agent';
+import type { ProjectContext, TestRequirements } from '../types/coding-task';
 import { buildFreezeChecklist } from './freeze-checklist';
+import { TokenBudgetTracker } from './token-budget';
 import type { Logger } from '../observability/logger';
 import { Logger as LoggerImpl } from '../observability/logger';
 import type { ObservabilityConfig } from '../config';
@@ -58,7 +68,8 @@ export type HumanInterventionCallback = (
 
 /** 弱介入决策：继续执行或回退到指定状态 */
 export type WeakInterventionDecision =
-  { action: 'continue' } | { action: 'fallback'; to: PipelineStateName; reason: string };
+  | { action: 'continue' }
+  | { action: 'fallback'; to: PipelineStateName; reason: string };
 
 /** 弱介入回调：在弱介入窗口内人工可决定继续或回退 */
 export type WeakInterventionCallback = (
@@ -68,12 +79,9 @@ export type WeakInterventionCallback = (
 
 /**
  * 需要弱介入窗口的状态（Agent 执行完成后、推进前）。
- * 注：DESIGN_REVIEWING 的弱介入已内聚到 runDesignReviewDialog 多轮对话循环
- *（interruptAfterEachRound + 终止条件暂停），不再走主循环的通用弱介入。
+ * 注：DESIGN_REVIEWING / CODE_REVIEWING 的弱介入已内聚到各自多轮对话循环
+ *（interruptAfterEachRound + 终止条件暂停），不走主循环的通用弱介入。
  */
-// 主循环通用弱介入仅覆盖 STORIES_GENERATING；
-// DESIGN_REVIEWING / CODE_REVIEWING 的弱介入在各自多轮对话循环内通过 interruptAfterEachRound 实现，
-// 不走主循环的通用弱介入路径（这两个状态在主循环顶部即被拦截）。
 const WEAK_INTERVENTION_STATES: PipelineStateName[] = ['STORIES_GENERATING'];
 
 /** Agent 注册表 */
@@ -104,6 +112,8 @@ export interface HarnessConfig {
   logger?: Logger;
   /** 实例 ID，不填则自动生成 */
   instanceId?: string;
+  /** 实例目录（产物/状态快照/日志落盘位置），默认 ./data/instances/{instanceId}（issue #82） */
+  instanceDir?: string;
   /** Agent 执行异常时的最大重试次数（默认 2，不含首次执行）。注意：BaseAgent 内部的输出解析失败重试不计入此层 */
   maxRetries?: number;
   /** 评审阶段最大对话轮次（默认 3，详见 docs/08-review-dialog.md）。应用层应从 config.coding.maxDesignReviewRounds/maxCodeReviewRounds 映射传入 */
@@ -118,6 +128,8 @@ export interface HarnessConfig {
   maxGreenAttempts?: number;
   /** 单流程 token 预算上限（0 表示不限制，超限暂停等人工；ADR-014，落地见 issue #39） */
   maxTokensPerRun?: number;
+  /** 单次 LLM 调用 token 上限（0 表示不限制，防单次输出异常膨胀；issue #39） */
+  maxTokensPerCall?: number;
   /**
    * 弱介入窗口等待人工决策的超时（毫秒，默认 30000）。
    * 超时未决策则自动 continue；设为 0 表示不超时、一直等待回调。
@@ -155,17 +167,32 @@ export class Harness {
   private readonly maxGreenAttempts: number;
   /** 单流程 token 预算（issue #39 落地时消费） */
   private readonly maxTokensPerRun: number;
+  /** 单次调用 token 上限（issue #39 落地时消费） */
+  private readonly maxTokensPerCall: number;
+  /** 流程级 Token 预算跟踪器（注入每个 AgentContext，BaseAgent 在 LLM 调用前后检查/累计） */
+  private readonly tokenBudget: TokenBudgetTracker;
   /** 弱介入窗口超时（毫秒，0 表示不超时） */
   private readonly weakConfirmationTimeoutMs: number;
   private knowledgeService?: KnowledgeService;
   private projectId?: string;
   private readonly globalContext: GlobalContext;
   readonly instanceId: string;
+  /** 实例目录（产物/快照/日志落盘根） */
+  private readonly instanceDir: string;
+  /** 评审多轮对话 Runner（issue #47 拆分） */
+  private readonly reviewDialog: ReviewDialogRunner;
+  /** 编码阶段 Runner（issue #47 拆分） */
+  private readonly codingPhase: CodingPhaseRunner;
 
   constructor(config: HarnessConfig) {
     this.instanceId = config.instanceId ?? `forge-${Date.now()}`;
     this.agents = config.agents;
-    this.artifactStore = config.artifactStore ?? new InMemoryArtifactStore();
+    // 实例目录：产物、状态快照、日志的落盘根目录（issue #82）
+    this.instanceDir = config.instanceDir ?? path.join('data', 'instances', this.instanceId);
+    // 默认文件系统产物存储：产物落盘，进程重启后可恢复；测试场景仍可显式传入 InMemoryArtifactStore
+    this.artifactStore =
+      config.artifactStore ??
+      new FileSystemArtifactStore(path.join(this.instanceDir, 'artifacts'));
     this.maxRetries = config.maxRetries ?? 2;
     this.maxReviewRounds = config.maxReviewRounds ?? 3;
     this.interruptAfterEachRound = config.interruptAfterEachRound ?? false;
@@ -183,6 +210,8 @@ export class Harness {
       );
     }
     this.maxTokensPerRun = config.maxTokensPerRun ?? 0;
+    this.maxTokensPerCall = config.maxTokensPerCall ?? 0;
+    this.tokenBudget = new TokenBudgetTracker(this.maxTokensPerRun, this.maxTokensPerCall);
     this.weakConfirmationTimeoutMs = config.weakConfirmationTimeoutMs ?? 30000;
     this.knowledgeService = config.knowledgeService;
     this.projectId = config.projectId;
@@ -207,8 +236,103 @@ export class Harness {
       this.logger = new LoggerImpl(obsConfig);
     }
 
-    const initialState = createInitialState(this.instanceId);
-    this.stateMachine = new StateMachine(initialState);
+    // 状态持久化（issue #82）：每次状态变更原子写 state.json 快照
+    const persistState = (state: PipelineState): void => {
+      try {
+        saveStateSnapshot(this.instanceDir, state);
+      } catch (err) {
+        this.logger?.warn(
+          `[Harness] 状态快照写入失败（不影响内存执行）: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    };
+    const snapshot = loadStateSnapshot(this.instanceDir);
+    if (snapshot) {
+      // 存在历史快照：恢复到上次状态（崩溃/重启续跑场景）
+      this.logger?.info(
+        `[Harness] 检测到历史快照，恢复实例状态: ${snapshot.currentState} (status=${snapshot.status})`,
+      );
+      this.stateMachine = new StateMachine(snapshot, { onStateChange: persistState });
+      this.restoredFromSnapshot = !isTerminalSnapshot(snapshot);
+    } else {
+      const initialState = createInitialState(this.instanceId);
+      this.stateMachine = new StateMachine(initialState, { onStateChange: persistState });
+      // 初始状态也落一次盘，保证进程一旦创建实例即具备可恢复快照
+      persistState(this.stateMachine.getState());
+    }
+
+    // issue #47 拆分：评审对话与编码阶段 Runner 注入共享依赖与跨类回调
+    this.reviewDialog = new ReviewDialogRunner(
+      {
+        agents: this.agents,
+        artifactStore: this.artifactStore,
+        stateMachine: this.stateMachine,
+        contextManager: this.contextManager,
+        instanceId: this.instanceId,
+        logger: this.logger,
+        maxReviewRounds: this.maxReviewRounds,
+        interruptAfterEachRound: this.interruptAfterEachRound,
+        knowledgeService: this.knowledgeService,
+        projectId: this.projectId,
+        tokenBudget: this.tokenBudget,
+      },
+      {
+        failExecution: (m) => this.failExecution(m),
+        attachInstanceId: (d) => this.attachInstanceId(d),
+        runExecutionLoop: () => this.runExecutionLoop(),
+        fallback: (to, reason) => this.fallback(to, reason),
+        resume: (a) => this.resume(a),
+        invokeWeakIntervention: (s, a) =>
+          invokeWeakIntervention(
+            this.onWeakIntervention,
+            this.logger,
+            this.instanceId,
+            this.weakConfirmationTimeoutMs,
+            s,
+            a,
+          ),
+        buildBlockingQuestion: (s) =>
+          buildBlockingQuestion(this.artifactStore, this.instanceId, s),
+        buildCodingTaskForStory: (story, index, total) =>
+          this.contextManager.buildCodingTaskForStory(this.instanceId, story, index, total, {
+            projectContext: this.projectContext,
+            testRequirements: this.testRequirements,
+          }),
+        onHumanIntervention: this.onHumanIntervention,
+      },
+    );
+    this.codingPhase = new CodingPhaseRunner(
+      {
+        agents: this.agents,
+        artifactStore: this.artifactStore,
+        stateMachine: this.stateMachine,
+        contextManager: this.contextManager,
+        instanceId: this.instanceId,
+        logger: this.logger,
+        knowledgeService: this.knowledgeService,
+        projectId: this.projectId,
+        tokenBudget: this.tokenBudget,
+        projectContext: this.projectContext,
+        testRequirements: this.testRequirements,
+      },
+      {
+        failExecution: (m) => this.failExecution(m),
+        attachInstanceId: (d) => this.attachInstanceId(d),
+        runExecutionLoop: () => this.runExecutionLoop(),
+        fallback: (to, reason) => this.fallback(to, reason),
+        invokeWeakIntervention: (s, a) =>
+          invokeWeakIntervention(
+            this.onWeakIntervention,
+            this.logger,
+            this.instanceId,
+            this.weakConfirmationTimeoutMs,
+            s,
+            a,
+          ),
+      },
+    );
 
     this.logger?.info(`[Harness] 实例创建: ${this.instanceId}`);
   }
@@ -227,6 +351,49 @@ export class Harness {
   listArtifacts() {
     return this.artifactStore.list(this.instanceId);
   }
+
+  /**
+   * 从快照续跑（issue #82）：进程崩溃/重启后，CLI --resume 使用。
+   *
+   * 恢复语义：
+   * - 终态（COMPLETED/FAILED/CANCELLED）：直接返回结果，不继续执行；
+   * - waiting_human（硬卡点/评审对话框暂停）：返回等待人工，由调用方 resume() 续跑；
+   * - running（阶段执行中崩溃）：按当前状态重新进入对应执行分支（runExecutionLoop 按 currentState 分发）。
+   */
+  async continueFromSnapshot(): Promise<HarnessExecutionResult> {
+    const state = this.stateMachine.getState();
+    this.logger?.info(`[Harness] 快照续跑: ${state.currentState} (status=${state.status})`);
+
+    if (isTerminalState(state.currentState)) {
+      return {
+        success: state.currentState === 'COMPLETED',
+        finalState: state.currentState,
+        message: `实例已处于终态 ${state.currentState}，无需续跑`,
+        waitingForHuman: false,
+      };
+    }
+
+    if (state.status === 'waiting_human') {
+      const question = buildBlockingQuestion(
+        this.artifactStore,
+        this.instanceId,
+        state.currentState,
+      );
+      return {
+        success: true,
+        finalState: state.currentState,
+        message: question,
+        waitingForHuman: true,
+        waitingQuestion: question,
+      };
+    }
+
+    // running：从当前状态重新执行（runExecutionLoop 按 currentState 分发对应阶段）
+    return this.runExecutionLoop();
+  }
+
+  /** 是否本次构造时从历史快照恢复了未完成实例 */
+  restoredFromSnapshot: boolean = false;
 
   /**
    * 开始执行流程
@@ -273,17 +440,17 @@ export class Harness {
       if (followupResult) return followupResult;
     } else if (state.currentState === 'DESIGN_REVIEWING') {
       // 方案评审多轮对话中途暂停（request_human / max_rounds）后的恢复
-      return this.resumeDesignReviewDialog();
+      return this.reviewDialog.resumeDesignReviewDialog();
     } else if (state.currentState === 'CODE_REVIEWING') {
       // 代码 CR 多轮对话中途暂停（request_human / max_rounds）后的恢复
-      return this.resumeCodeReviewDialog();
+      return this.reviewDialog.resumeCodeReviewDialog();
     } else {
       // 其他硬卡点：直接处理人工回答
-      await this.handleHumanAnswer(state.currentState, humanAnswer);
+      handleHumanAnswer(this.logger, state.currentState, humanAnswer);
     }
 
     // 从硬卡点状态前进
-    const nextState = this.getNextStateAfterBlocking(state.currentState);
+    const nextState = getNextStateAfterBlocking(state.currentState);
     if (!nextState) {
       return this.failExecution(`无法确定 ${state.currentState} 的下一个状态`);
     }
@@ -321,7 +488,10 @@ export class Harness {
     const now = new Date().toISOString();
     const updatedRequirement: StructuredRequirement = {
       ...requirement,
-      humanAnswers: [...(requirement.humanAnswers ?? []), { answer: humanAnswer, answeredAt: now }],
+      humanAnswers: [
+        ...(requirement.humanAnswers ?? []),
+        { answer: humanAnswer, answeredAt: now },
+      ],
       clarificationLog: requirement.clarificationLog.map((q) =>
         q.status === 'pending' ? { ...q, status: 'resolved' as const, answeredAt: now } : q,
       ),
@@ -340,13 +510,16 @@ export class Harness {
       globalContext: this.contextManager.getGlobalContext(),
       knowledgeService: this.knowledgeService,
       projectId: this.projectId,
+      tokenBudget: this.tokenBudget,
     };
 
     try {
       const result = await this.agents.requirement.execute(context);
       if (!result.success || !result.data) {
         this.logger?.warn(
-          `[Harness] 澄清 followup 失败，直接推进: ${result.errors.map((e) => e.message).join('; ')}`,
+          `[Harness] 澄清 followup 失败，直接推进: ${result.errors
+            .map((e: { message: string }) => e.message)
+            .join('; ')}`,
         );
         return null;
       }
@@ -366,7 +539,9 @@ export class Harness {
 
       if (pendingQuestions.length > 0) {
         // 还有未澄清问题，停留在澄清状态，继续等待人工
-        this.logger?.info(`[Harness] 还有 ${pendingQuestions.length} 个澄清问题待回答，继续等待`);
+        this.logger?.info(
+          `[Harness] 还有 ${pendingQuestions.length} 个澄清问题待回答，继续等待`,
+        );
         return {
           success: true,
           finalState: 'REQUIREMENT_CLARIFICATION',
@@ -484,21 +659,21 @@ export class Harness {
 
       // 方案评审走多轮对话循环（Reviewer ↔ Designer，#42），不走通用单次执行路径
       if (state.currentState === 'DESIGN_REVIEWING') {
-        return this.runDesignReviewDialog();
+        return this.reviewDialog.runDesignReviewDialog();
       }
 
       // 编码为逐故事 TDD 循环 + 部分成功出口（#40），不走通用单次执行路径
       if (state.currentState === 'CODING') {
-        return this.runCodingPhase();
+        return this.codingPhase.runCodingPhase();
       }
 
       // 代码 CR 走多轮对话循环（Reviewer ↔ Coder，复用 #42 模式），不走通用单次执行路径
       if (state.currentState === 'CODE_REVIEWING') {
-        return this.runCodeReviewDialog();
+        return this.reviewDialog.runCodeReviewDialog();
       }
 
       // 检查是否有对应 Agent
-      const agent = this.getAgentForState(state.currentState);
+      const agent = getAgentForState(state.currentState, this.agents);
       if (!agent) {
         // ADR-014：Agent 未实现属于开发期错误，直接 FAILED；
         // SUSPENDED 只保留给运行时原因（外部依赖不可用、评审达最大轮次等人工决策场景）
@@ -518,12 +693,13 @@ export class Harness {
       // 调用 Agent
       const context: AgentContext = {
         instanceId: this.instanceId,
-        stage: this.stateToStage(state.currentState),
+        stage: stateToStage(state.currentState),
         input: agentInput,
         globalContext: this.contextManager.getGlobalContext(),
         // ADR-014：知识库检索职责收归 Agent，服务通过上下文注入，由 Agent 内部按需检索
         knowledgeService: this.knowledgeService,
         projectId: this.projectId,
+        tokenBudget: this.tokenBudget,
       };
 
       let result: AgentResult;
@@ -534,13 +710,17 @@ export class Harness {
         const retryCount = this.stateMachine.incrementRetry();
         if (retryCount < this.maxRetries) {
           this.logger?.warn(
-            `[Harness] Agent 执行异常，第 ${retryCount} 次重试: ${err instanceof Error ? err.message : String(err)}`,
+            `[Harness] Agent 执行异常，第 ${retryCount} 次重试: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
           );
           state = this.stateMachine.getState();
           continue;
         }
         return this.failExecution(
-          `Agent 执行异常（重试 ${retryCount} 次）: ${err instanceof Error ? err.message : String(err)}`,
+          `Agent 执行异常（重试 ${retryCount} 次）: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
         );
       }
 
@@ -552,7 +732,7 @@ export class Harness {
       }
 
       // 保存产物（回填 instanceId，保证产物对象自描述、持久化后可判断归属）
-      const artifactStage = this.getArtifactStage(state.currentState);
+      const artifactStage = getArtifactStage(state.currentState);
       if (artifactStage && result.data) {
         this.attachInstanceId(result.data);
         const artifactId = this.artifactStore.save(artifactStage, this.instanceId, result.data);
@@ -568,7 +748,14 @@ export class Harness {
       // 弱介入窗口：特定状态完成后，人工可介入决定继续或回退（超时自动继续）
       if (WEAK_INTERVENTION_STATES.includes(state.currentState) && this.onWeakIntervention) {
         this.logger?.info(`[Harness] 进入弱介入窗口: ${state.currentState}`);
-        const decision = await this.invokeWeakIntervention(state.currentState, result.data);
+        const decision = await invokeWeakIntervention(
+          this.onWeakIntervention,
+          this.logger,
+          this.instanceId,
+          this.weakConfirmationTimeoutMs,
+          state.currentState,
+          result.data,
+        );
 
         if (decision.action === 'fallback') {
           this.logger?.warn(
@@ -589,7 +776,7 @@ export class Harness {
       }
 
       // 推进到下一个状态
-      const nextState = this.getNextState(state.currentState);
+      const nextState = getNextState(state.currentState);
       if (!nextState) {
         return this.failExecution(`无法确定 ${state.currentState} 的下一个状态`);
       }
@@ -607,7 +794,11 @@ export class Harness {
 
       // 检查是否进入硬卡点
       if (isHardBlockingState(state.currentState)) {
-        const question = this.buildBlockingQuestion(state.currentState);
+        const question = buildBlockingQuestion(
+          this.artifactStore,
+          this.instanceId,
+          state.currentState,
+        );
         this.logger?.info(`[Harness] 进入硬卡点: ${state.currentState}，等待人工介入`);
 
         // 如果有回调，自动调用；否则返回等待状态
@@ -637,798 +828,8 @@ export class Harness {
   }
 
   // ============================================================
-  // 方案评审多轮对话循环（#42，详见 docs/08-review-dialog.md）
-  // ============================================================
-
-  /**
-   * 方案评审对话循环：Reviewer 评审 →（approve 退出 / request_human 暂停 /
-   * request_changes 由 Designer.revise 修改）→ 下一轮，直到通过、升级人工或达到最大轮次。
-   *
-   * - 程序化判定：是否通过只看 ReviewResult.resolvedAction（review-policy 已按 blocking issue 仲裁）
-   * - 每轮落盘 design（版本递增）、design-review（最新一轮）、design-review-history（只增）
-   * - 中途暂停 currentState 停在 DESIGN_REVIEWING、status=waiting_human，resume 从 history 续跑
-   */
-  private async runDesignReviewDialog(): Promise<HarnessExecutionResult> {
-    const reviewAgent = this.agents.review;
-    const designAgent = this.agents.design;
-    if (!reviewAgent) {
-      return this.failExecution('状态 DESIGN_REVIEWING 缺少 ReviewAgent');
-    }
-
-    const currentDesign0 = this.artifactStore.get<FrontendDesignDoc>('design', this.instanceId);
-    const stories = this.artifactStore.get<UserStorySet>('stories', this.instanceId);
-    if (!currentDesign0 || !stories) {
-      return this.failExecution('方案评审缺少上游产物（design/stories）');
-    }
-
-    const dialogStart = Date.now();
-    let currentDesign = currentDesign0;
-    let previousIssues: ReviewIssue[] = [];
-    let issueResponses = [] as DesignRevision['issueResponses'];
-    const dialogMessages: DialogMessage[] = [];
-
-    // 恢复未结束的对话历史（resume 续跑场景），否则新建
-    let history =
-      this.artifactStore.get<ReviewDialogHistory>('design-review-history', this.instanceId) ??
-      undefined;
-    if (!history || history.finalVerdict === 'approved') {
-      history = {
-        reviewType: 'design-review',
-        maxRounds: this.maxReviewRounds,
-        rounds: [],
-        finalVerdict: 'needs_human',
-        finalVersion: 0,
-        totalDurationMs: 0,
-      };
-    }
-    const startRound = history.rounds.length + 1;
-    // resume 续跑时从上一轮恢复 previousIssues（否则第 2 轮起 previousIssues 为空，触发 #49 MISSING_PREVIOUS_ISSUES）
-    if (history.rounds.length > 0) {
-      previousIssues = history.rounds[history.rounds.length - 1].review.issues;
-    }
-
-    for (let round = startRound; round <= this.maxReviewRounds; round++) {
-      // 1. Reviewer 评审
-      const reviewCtx: AgentContext = {
-        instanceId: this.instanceId,
-        stage: 'design-reviewing',
-        input: {
-          type: 'review-design',
-          design: currentDesign,
-          round,
-          previousIssues,
-          issueResponses,
-        },
-        globalContext: this.contextManager.getGlobalContext(),
-        knowledgeService: this.knowledgeService,
-        projectId: this.projectId,
-      };
-
-      const reviewResult = await reviewAgent.execute(reviewCtx);
-      if (!reviewResult.success || !reviewResult.data) {
-        return this.failExecution(
-          `第 ${round} 轮方案评审失败: ${reviewResult.errors.map((e) => e.message).join('; ')}`,
-        );
-      }
-      const review = reviewResult.data as ReviewResult;
-      this.attachInstanceId(review);
-      this.artifactStore.save('design-review', this.instanceId, review);
-      dialogMessages.push({
-        role: 'reviewer',
-        content: review.summary,
-        structuredOutput: review,
-        round,
-        timestamp: new Date().toISOString(),
-      });
-
-      // 2. 以程序化仲裁动作为准
-      if (review.resolvedAction === 'approve') {
-        history.rounds.push({
-          round,
-          review,
-          messages: [...dialogMessages],
-          allBlockingResolved: true,
-          durationMs: Date.now() - dialogStart,
-        });
-        history.finalVerdict = 'approved';
-        history.finalVersion = currentDesign.version;
-        history.totalDurationMs = Date.now() - dialogStart;
-        this.artifactStore.save('design-review-history', this.instanceId, history);
-        this.logger?.info(`[Harness] 方案评审第 ${round} 轮通过，进入 API 契约确认`);
-        return this.advanceAfterReview();
-      }
-
-      if (review.resolvedAction === 'request_human') {
-        history.rounds.push({
-          round,
-          review,
-          messages: [...dialogMessages],
-          allBlockingResolved: false,
-          durationMs: Date.now() - dialogStart,
-        });
-        history.finalVerdict = 'needs_human';
-        history.suspendReason = '评审请求人工裁决（request_human）';
-        history.totalDurationMs = Date.now() - dialogStart;
-        this.artifactStore.save('design-review-history', this.instanceId, history);
-        return this.suspendReviewForHuman(history.suspendReason);
-      }
-
-      // 3. request_changes：需要 Designer 修订
-      if (!designAgent) {
-        history.finalVerdict = 'needs_human';
-        history.suspendReason = '评审要求修改但未注册 DesignAgent，无法自动修订';
-        this.artifactStore.save('design-review-history', this.instanceId, history);
-        return this.suspendReviewForHuman(history.suspendReason);
-      }
-
-      const openIssues = review.issues.filter((i) => i.status === 'open');
-      const reviseCtx: AgentContext = {
-        instanceId: this.instanceId,
-        stage: 'design-reviewing',
-        input: {
-          type: 'revise-design',
-          previousDesign: currentDesign,
-          previousIssues: openIssues,
-          round,
-          stories,
-        },
-        globalContext: this.contextManager.getGlobalContext(),
-        knowledgeService: this.knowledgeService,
-        projectId: this.projectId,
-      };
-      const reviseResult = await designAgent.revise(reviseCtx);
-      if (!reviseResult.success || !reviseResult.data) {
-        return this.failExecution(
-          `第 ${round} 轮方案修订失败: ${reviseResult.errors.map((e) => e.message).join('; ')}`,
-        );
-      }
-      const revision = reviseResult.data as DesignRevision;
-      currentDesign = revision.updatedDesign;
-      this.attachInstanceId(currentDesign);
-      this.artifactStore.save('design', this.instanceId, currentDesign);
-      issueResponses = revision.issueResponses;
-      // 下一轮闭环校验以本轮全部问题为基准（findUnverifiedIssues 内部跳过已闭环项）
-      previousIssues = review.issues;
-      dialogMessages.push({
-        role: 'designer',
-        content: revision.changeSummary,
-        structuredOutput: revision,
-        round,
-        timestamp: new Date().toISOString(),
-      });
-
-      history.rounds.push({
-        round,
-        review,
-        revision,
-        messages: [...dialogMessages],
-        allBlockingResolved: false,
-        durationMs: Date.now() - dialogStart,
-      });
-      this.artifactStore.save('design-review-history', this.instanceId, history);
-
-      // 4. 每轮后可选弱介入（默认关闭）
-      if (this.interruptAfterEachRound && this.onWeakIntervention) {
-        const decision = await this.invokeWeakIntervention('DESIGN_REVIEWING', history);
-        if (decision.action === 'fallback') {
-          return this.fallback(decision.to, decision.reason);
-        }
-      }
-    }
-
-    // 5. 达到最大轮次仍未通过 → 暂停等人工
-    history.finalVerdict = 'max_rounds_reached';
-    history.suspendReason = `已达到最大评审轮次（${this.maxReviewRounds}）仍存在 blocking 问题，需要人工决策`;
-    history.totalDurationMs = Date.now() - dialogStart;
-    this.artifactStore.save('design-review-history', this.instanceId, history);
-    return this.suspendReviewForHuman(history.suspendReason);
-  }
-
-  /** 评审通过后推进到 API_CONFIRMATION 硬卡点并处理等待/回调 */
-  private async advanceAfterReview(): Promise<HarnessExecutionResult> {
-    const nextState = this.getNextState('DESIGN_REVIEWING');
-    if (!nextState) return this.failExecution('无法确定 DESIGN_REVIEWING 的下一状态');
-    const advance = this.stateMachine.transition({ type: 'ADVANCE', to: nextState });
-    if (!advance.success) return this.failExecution(`状态推进失败: ${advance.message}`);
-
-    if (isHardBlockingState(nextState)) {
-      const question = this.buildBlockingQuestion(nextState);
-      this.logger?.info(`[Harness] 进入硬卡点: ${nextState}，等待人工介入`);
-      if (this.onHumanIntervention) {
-        const answer = await this.onHumanIntervention(nextState, question, {
-          instanceId: this.instanceId,
-        });
-        return this.resume(answer);
-      }
-      return {
-        success: true,
-        finalState: nextState,
-        message: question,
-        waitingForHuman: true,
-        waitingQuestion: question,
-      };
-    }
-    // 非硬卡点则继续主循环
-    return this.runExecutionLoop();
-  }
-
-  /** 评审对话中途暂停：currentState 不变，仅置 waiting_human */
-  private suspendReviewForHuman(reason: string): HarnessExecutionResult {
-    this.stateMachine.pauseForHuman(reason);
-    this.logger?.warn(`[Harness] 方案评审暂停等待人工: ${reason}`);
-    return {
-      success: true,
-      finalState: 'DESIGN_REVIEWING',
-      message: reason,
-      waitingForHuman: true,
-      waitingQuestion: reason,
-    };
-  }
-
-  /**
-   * 方案评审对话暂停后的恢复：
-   * - max_rounds_reached：人工 resume 视为接受当前版本，推进到 API 确认硬卡点
-   * - needs_human（request_human，轮次未用完）：从 history 续跑下一轮评审
-   */
-  private async resumeDesignReviewDialog(): Promise<HarnessExecutionResult> {
-    const history = this.artifactStore.get<ReviewDialogHistory>(
-      'design-review-history',
-      this.instanceId,
-    );
-    this.stateMachine.markRunning();
-
-    if (history?.finalVerdict === 'max_rounds_reached') {
-      this.logger?.info('[Harness] 人工在最大轮次后放行方案评审，推进到 API 确认');
-      return this.advanceAfterReview();
-    }
-    // 续跑对话循环（startRound 由已保存 rounds 数推导）
-    return this.runExecutionLoop();
-  }
-
-  // ============================================================
-  // 编码阶段：逐故事 TDD 循环 + 部分成功出口（#40）
-  // ============================================================
-
-  /**
-   * 逐故事编码：按依赖拓扑排序，对每个故事构建 CodingTask 并调 CodingAgent.generateCode；
-   * 单故事失败不阻塞整体，最后聚合并按 all-success / partial / all-failed 分流。
-   */
-  private async runCodingPhase(): Promise<HarnessExecutionResult> {
-    const codingAgent = this.agents.coding;
-    if (!codingAgent) return this.failExecution('状态 CODING 缺少 CodingAgent');
-
-    const stories = this.artifactStore.get<UserStorySet>('stories', this.instanceId);
-    const design = this.artifactStore.get<FrontendDesignDoc>('design', this.instanceId);
-    if (!stories || !design) return this.failExecution('编码缺少上游产物（stories/design）');
-
-    const { sorted: ordered, cyclicStoryIds } = topoSortStories(stories.stories);
-    const total = ordered.length;
-    if (total === 0) return this.failExecution('用户故事为空，无法编码');
-    if (cyclicStoryIds.length > 0) {
-      this.logger?.warn(
-        `[Harness] 故事依赖存在循环，涉及 ${cyclicStoryIds.length} 个故事（${cyclicStoryIds.join(', ')}），按输入顺序保底追加，可能导致编码时引用未生成组件`,
-      );
-    }
-
-    const results: CodingResult[] = [];
-    for (let i = 0; i < total; i++) {
-      const story = ordered[i];
-      const task = this.contextManager.buildCodingTaskForStory(this.instanceId, story, i, total, {
-        projectContext: this.projectContext,
-        testRequirements: this.testRequirements,
-      });
-      if (!task) {
-        return this.failExecution(`无法为故事 ${story.id} 构建编码任务（缺少技术方案）`);
-      }
-
-      const ctx: AgentContext = {
-        instanceId: this.instanceId,
-        stage: 'coding',
-        input: task,
-        globalContext: this.contextManager.getGlobalContext(),
-        knowledgeService: this.knowledgeService,
-        projectId: this.projectId,
-      };
-
-      try {
-        const r = await codingAgent.generateCode(ctx);
-        if (r.data) {
-          results.push(r.data);
-        } else {
-          results.push(
-            this.failedStoryResult(task, r.errors.map((e) => e.message).join('; ') || '编码失败'),
-          );
-        }
-      } catch (err) {
-        // 单故事异常隔离：记录失败后继续后续故事（#40 不阻塞整体）
-        const reason = err instanceof Error ? err.message : String(err);
-        this.logger?.error(`[Harness] 故事 ${story.id} 编码异常，跳过: ${reason}`);
-        results.push(this.failedStoryResult(task, reason));
-      }
-    }
-
-    const phase = aggregateCodingResults(results, {
-      id: `coding-phase-${this.instanceId}`,
-      instanceId: this.instanceId,
-      designDocId: design.id,
-    });
-    this.attachInstanceId(phase);
-    this.artifactStore.save('coding', this.instanceId, phase);
-    this.logger?.info(
-      `[Harness] 编码阶段完成: ${phase.overallStatus}，成功 ${phase.successStoryIds.length}/部分 ${phase.partialStoryIds.length}/失败 ${phase.failedStories.length}`,
-    );
-
-    // 全部失败（无任何成功/部分）→ FAILED，不进入 CR
-    if (!hasAnySuccessStory(phase)) {
-      return this.failExecution(
-        `编码全部故事失败: ${phase.failedStories.map((f) => `${f.storyId}(${f.reason})`).join('; ')}`,
-      );
-    }
-
-    // 部分成功：弱介入窗口，人工决定带失败继续 / 回退（超时默认继续）
-    if (phase.overallStatus === 'partial-success') {
-      const decision = await this.invokeWeakIntervention('CODING', phase);
-      if (decision.action === 'fallback') {
-        const fb = this.stateMachine.transition({
-          type: 'FALLBACK',
-          to: decision.to,
-          reason: decision.reason,
-        });
-        if (!fb.success) return this.failExecution(`编码部分成功回退失败: ${fb.message}`);
-        this.logger?.warn(`[Harness] 编码部分成功，回退到 ${decision.to}`);
-        return this.runExecutionLoop();
-      }
-    }
-
-    return this.advanceAfterCoding(phase);
-  }
-
-  /** 编码完成推进到 CODE_REVIEWING，进入代码 CR 多轮对话 */
-  private async advanceAfterCoding(phase: CodingPhaseResult): Promise<HarnessExecutionResult> {
-    const nextState = this.getNextState('CODING');
-    if (!nextState) return this.failExecution('无法确定 CODING 的下一状态');
-    const advance = this.stateMachine.transition({ type: 'ADVANCE', to: nextState });
-    if (!advance.success) return this.failExecution(`状态推进失败: ${advance.message}`);
-    this.logger?.info(
-      `[Harness] 编码阶段完成（成功 ${phase.successStoryIds.length}、部分 ${phase.partialStoryIds.length}、失败 ${phase.failedStories.length}），进入代码 CR`,
-    );
-    return this.runExecutionLoop();
-  }
-
-  // ============================================================
-  // 代码 CR 多轮对话（Reviewer ↔ Coder，复用 #42 模式）
-  // ============================================================
-
-  private async runCodeReviewDialog(): Promise<HarnessExecutionResult> {
-    const reviewAgent = this.agents.review;
-    const codingAgent = this.agents.coding;
-    if (!reviewAgent) return this.failExecution('状态 CODE_REVIEWING 缺少 ReviewAgent');
-
-    const design = this.artifactStore.get<FrontendDesignDoc>('design', this.instanceId);
-    let coding = this.artifactStore.get<CodingPhaseResult>('coding', this.instanceId);
-    const stories = this.artifactStore.get<UserStorySet>('stories', this.instanceId);
-    if (!design || !coding || !stories)
-      return this.failExecution('代码 CR 缺少上游产物（design/coding/stories）');
-
-    const dialogStart = Date.now();
-    let previousIssues: ReviewIssue[] = [];
-    let issueResponses: IssueResponse[] = [];
-    const dialogMessages: DialogMessage[] = [];
-
-    // 恢复未结束的对话历史（resume 续跑场景），否则新建
-    let history =
-      this.artifactStore.get<ReviewDialogHistory>('code-review-history', this.instanceId) ??
-      undefined;
-    if (!history || history.finalVerdict === 'approved') {
-      history = {
-        reviewType: 'code-review',
-        maxRounds: this.maxReviewRounds,
-        rounds: [],
-        finalVerdict: 'needs_human',
-        finalVersion: 0,
-        totalDurationMs: 0,
-      };
-    }
-    const startRound = history.rounds.length + 1;
-    // resume 续跑时从上一轮恢复 previousIssues（否则第 2 轮起 previousIssues 为空，触发 #49 MISSING_PREVIOUS_ISSUES）
-    if (history.rounds.length > 0) {
-      previousIssues = history.rounds[history.rounds.length - 1].review.issues;
-    }
-
-    for (let round = startRound; round <= this.maxReviewRounds; round++) {
-      // 1. Reviewer CR（只针对 success/partial 故事）
-      const reviewCtx: AgentContext = {
-        instanceId: this.instanceId,
-        stage: 'code-reviewing',
-        input: {
-          type: 'review-code',
-          design,
-          coding,
-          round,
-          previousIssues,
-          issueResponses,
-        } as CodeReviewInput,
-        globalContext: this.contextManager.getGlobalContext(),
-        knowledgeService: this.knowledgeService,
-        projectId: this.projectId,
-      };
-
-      const reviewResult = await reviewAgent.execute(reviewCtx);
-      if (!reviewResult.success || !reviewResult.data) {
-        return this.failExecution(
-          `第 ${round} 轮代码 CR 失败: ${reviewResult.errors.map((e) => e.message).join('; ')}`,
-        );
-      }
-      const review = reviewResult.data as ReviewResult;
-      this.attachInstanceId(review);
-      this.artifactStore.save('code-review', this.instanceId, review);
-      dialogMessages.push({
-        role: 'reviewer',
-        content: review.summary,
-        structuredOutput: review,
-        round,
-        timestamp: new Date().toISOString(),
-      });
-
-      // 2. 以程序化仲裁动作为准
-      if (review.resolvedAction === 'approve') {
-        history.rounds.push({
-          round,
-          review,
-          messages: [...dialogMessages],
-          allBlockingResolved: true,
-          durationMs: Date.now() - dialogStart,
-        });
-        history.finalVerdict = 'approved';
-        history.totalDurationMs = Date.now() - dialogStart;
-        this.artifactStore.save('code-review-history', this.instanceId, history);
-        this.logger?.info(`[Harness] 代码 CR 第 ${round} 轮通过`);
-        return this.advanceAfterCodeReview();
-      }
-
-      if (review.resolvedAction === 'request_human') {
-        history.rounds.push({
-          round,
-          review,
-          messages: [...dialogMessages],
-          allBlockingResolved: false,
-          durationMs: Date.now() - dialogStart,
-        });
-        history.finalVerdict = 'needs_human';
-        history.suspendReason = '代码 CR 请求人工裁决（request_human）';
-        history.totalDurationMs = Date.now() - dialogStart;
-        this.artifactStore.save('code-review-history', this.instanceId, history);
-        return this.suspendCodeReviewForHuman(history.suspendReason);
-      }
-
-      // 3. request_changes：Coder 修订受影响的故事
-      if (!codingAgent) {
-        history.finalVerdict = 'needs_human';
-        history.suspendReason = '代码 CR 要求修改但未注册 CodingAgent，无法自动修订';
-        this.artifactStore.save('code-review-history', this.instanceId, history);
-        return this.suspendCodeReviewForHuman(history.suspendReason);
-      }
-
-      const openIssues = review.issues.filter((i) => i.status === 'open');
-      const affectedStoryIds = new Set(openIssues.flatMap((i) => i.relatedStoryIds ?? []));
-      const reviewable = coding.results.filter((r) => r.status !== 'failed');
-      const targets =
-        affectedStoryIds.size > 0
-          ? reviewable.filter((r) => affectedStoryIds.has(r.storyId))
-          : reviewable;
-
-      const responseMap = new Map<string, IssueResponse>();
-      let anyRevised = false;
-      for (const currentResult of targets) {
-        const story = stories.stories.find((s) => s.id === currentResult.storyId);
-        if (!story) continue;
-        const storyIndex = stories.stories.findIndex((s) => s.id === currentResult.storyId);
-        const task = this.contextManager.buildCodingTaskForStory(
-          this.instanceId,
-          story,
-          storyIndex,
-          stories.stories.length,
-          { projectContext: this.projectContext, testRequirements: this.testRequirements },
-        );
-        if (!task) continue;
-
-        const reviseCtx: AgentContext = {
-          instanceId: this.instanceId,
-          stage: 'code-reviewing',
-          input: {
-            type: 'revise-code',
-            task,
-            currentResult,
-            previousIssues: openIssues,
-            round,
-          },
-          globalContext: this.contextManager.getGlobalContext(),
-          knowledgeService: this.knowledgeService,
-          projectId: this.projectId,
-        };
-
-        try {
-          const reviseResult = await codingAgent.revise(reviseCtx);
-          if (reviseResult.success && reviseResult.data) {
-            const idx = coding.results.findIndex((r) => r.storyId === currentResult.storyId);
-            if (idx >= 0) coding.results[idx] = reviseResult.data.updatedResult;
-            for (const resp of reviseResult.data.issueResponses)
-              responseMap.set(resp.issueId, resp);
-            dialogMessages.push({
-              role: 'coder',
-              content: reviseResult.data.changeSummary,
-              structuredOutput: reviseResult.data,
-              round,
-              timestamp: new Date().toISOString(),
-            });
-            anyRevised = true;
-          }
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          this.logger?.error(`[Harness] 故事 ${currentResult.storyId} CR 修订异常: ${reason}`);
-        }
-      }
-
-      if (!anyRevised) {
-        return this.failExecution(`第 ${round} 轮代码 CR 要求修改，但没有任何故事成功修订`);
-      }
-
-      // 重新聚合并更新 coding 产物（CR revise 后版本 +1，单调递增）
-      issueResponses = Array.from(responseMap.values());
-      coding = aggregateCodingResults(coding.results, {
-        id: coding.id,
-        instanceId: this.instanceId,
-        designDocId: design.id,
-        version: (coding.version ?? 1) + 1,
-      });
-      this.attachInstanceId(coding);
-      this.artifactStore.save('coding', this.instanceId, coding);
-      previousIssues = review.issues;
-
-      history.rounds.push({
-        round,
-        review,
-        messages: [...dialogMessages],
-        allBlockingResolved: false,
-        durationMs: Date.now() - dialogStart,
-      });
-      this.artifactStore.save('code-review-history', this.instanceId, history);
-
-      // 4. 每轮后可选弱介入（默认关闭）
-      if (this.interruptAfterEachRound && this.onWeakIntervention) {
-        const decision = await this.invokeWeakIntervention('CODE_REVIEWING', history);
-        if (decision.action === 'fallback') {
-          return this.fallback(decision.to, decision.reason);
-        }
-      }
-    }
-
-    // 5. 达到最大轮次仍未通过 → 暂停等人工
-    history.finalVerdict = 'max_rounds_reached';
-    history.suspendReason = `已达到最大代码 CR 轮次（${this.maxReviewRounds}）仍存在 blocking 问题，需要人工决策`;
-    history.totalDurationMs = Date.now() - dialogStart;
-    this.artifactStore.save('code-review-history', this.instanceId, history);
-    return this.suspendCodeReviewForHuman(history.suspendReason);
-  }
-
-  /** CR 通过后推进到 DELIVERING；交付阶段（PR）未实现，停在阶段边界等人工 */
-  private async advanceAfterCodeReview(): Promise<HarnessExecutionResult> {
-    const nextState = this.getNextState('CODE_REVIEWING');
-    if (!nextState) return this.failExecution('无法确定 CODE_REVIEWING 的下一状态');
-    const advance = this.stateMachine.transition({ type: 'ADVANCE', to: nextState });
-    if (!advance.success) return this.failExecution(`状态推进失败: ${advance.message}`);
-
-    this.logger?.info('[Harness] 代码 CR 通过，进入交付阶段（DELIVERING）');
-    // 继续执行主循环：DeliveryAgent 执行 → 保存 delivery 产物 → 推进到 DELIVERY_CONFIRMATION 硬卡点
-    return this.runExecutionLoop();
-  }
-
-  /** 代码 CR 对话中途暂停：currentState 不变，仅置 waiting_human */
-  private suspendCodeReviewForHuman(reason: string): HarnessExecutionResult {
-    this.stateMachine.pauseForHuman(reason);
-    this.logger?.warn(`[Harness] 代码 CR 暂停等待人工: ${reason}`);
-    return {
-      success: true,
-      finalState: 'CODE_REVIEWING',
-      message: reason,
-      waitingForHuman: true,
-      waitingQuestion: reason,
-    };
-  }
-
-  /**
-   * 代码 CR 对话暂停后的恢复：
-   * - max_rounds_reached：人工 resume 视为接受当前版本，推进到 DELIVERING
-   * - needs_human（request_human，轮次未用完）：从 history 续跑下一轮 CR
-   */
-  private async resumeCodeReviewDialog(): Promise<HarnessExecutionResult> {
-    const history = this.artifactStore.get<ReviewDialogHistory>(
-      'code-review-history',
-      this.instanceId,
-    );
-    if (!history) {
-      return this.failExecution('恢复代码 CR 对话失败：缺少 code-review-history 产物');
-    }
-    this.stateMachine.markRunning();
-    if (history.finalVerdict === 'max_rounds_reached') {
-      this.logger?.info('[Harness] 代码 CR 达最大轮次，人工确认接受当前版本，推进到交付');
-      return this.advanceAfterCodeReview();
-    }
-    this.logger?.info(`[Harness] 代码 CR 从第 ${history.rounds.length + 1} 轮续跑`);
-    return this.runCodeReviewDialog();
-  }
-
-  /** 构造单故事失败结果（异常/Agent 失败时占位，保证聚合输入完整） */
-  private failedStoryResult(task: CodingTask, reason: string): CodingResult {
-    return {
-      id: `coding-${task.storyId}`,
-      instanceId: this.instanceId,
-      taskId: task.taskId,
-      storyId: task.storyId,
-      status: 'failed',
-      files: [],
-      testResult: {
-        totalTests: 0,
-        passedTests: 0,
-        failedTests: 0,
-        skippedTests: 0,
-        environment: 'sandbox',
-        outputSummary: reason,
-        allPassed: false,
-      },
-      tddCycles: [],
-      issues: [reason],
-      completedAt: new Date().toISOString(),
-    };
-  }
-
-  // ============================================================
-  // 状态到 Agent 的映射
-  // ============================================================
-
-  private getAgentForState(state: PipelineStateName): BaseAgent | undefined {
-    switch (state) {
-      case 'REQUIREMENT_PARSING':
-      case 'STORIES_GENERATING':
-        return this.agents.requirement;
-      case 'DESIGN_GENERATING':
-        return this.agents.design;
-      case 'DESIGN_REVIEWING':
-      case 'CODE_REVIEWING':
-        return this.agents.review;
-      case 'CODING':
-        return this.agents.coding;
-      case 'DELIVERING':
-        return this.agents.delivery;
-      default:
-        return undefined;
-    }
-  }
-
-  private getArtifactStage(state: PipelineStateName): ArtifactStage | undefined {
-    switch (state) {
-      case 'REQUIREMENT_PARSING':
-        return 'requirement';
-      case 'STORIES_GENERATING':
-        return 'stories';
-      case 'DESIGN_GENERATING':
-        return 'design';
-      case 'DESIGN_REVIEWING':
-        return 'design-review';
-      case 'CODING':
-        return 'coding';
-      case 'CODE_REVIEWING':
-        return 'code-review';
-      case 'DELIVERING':
-        return 'delivery';
-      default:
-        return undefined;
-    }
-  }
-
-  private getNextState(state: PipelineStateName): PipelineStateName | undefined {
-    const transitions: Record<PipelineStateName, PipelineStateName> = {
-      INIT: 'REQUIREMENT_PARSING',
-      REQUIREMENT_PARSING: 'REQUIREMENT_CLARIFICATION',
-      REQUIREMENT_CLARIFICATION: 'STORIES_GENERATING',
-      STORIES_GENERATING: 'DESIGN_GENERATING',
-      // ADR-014：方案生成 → 方案评审 → API 确认 → 编码
-      DESIGN_GENERATING: 'DESIGN_REVIEWING',
-      DESIGN_REVIEWING: 'API_CONFIRMATION',
-      API_CONFIRMATION: 'CODING',
-      CODING: 'CODE_REVIEWING',
-      CODE_REVIEWING: 'DELIVERING',
-      DELIVERING: 'DELIVERY_CONFIRMATION',
-      DELIVERY_CONFIRMATION: 'COMPLETED',
-      COMPLETED: 'COMPLETED',
-      FAILED: 'FAILED',
-      CANCELLED: 'CANCELLED',
-      SUSPENDED: 'SUSPENDED',
-    };
-    return transitions[state];
-  }
-
-  private getNextStateAfterBlocking(state: PipelineStateName): PipelineStateName | undefined {
-    // 硬卡点确认后，直接进入下一个执行状态
-    return this.getNextState(state);
-  }
-
-  // ============================================================
-  // 人工介入处理
-  // ============================================================
-
-  private buildBlockingQuestion(state: PipelineStateName): string {
-    switch (state) {
-      case 'REQUIREMENT_CLARIFICATION': {
-        const requirement = this.artifactStore.get<StructuredRequirement>(
-          'requirement',
-          this.instanceId,
-        );
-        const pendingQuestions = requirement?.clarificationLog.filter(
-          (q) => q.status === 'pending',
-        );
-        if (pendingQuestions && pendingQuestions.length > 0) {
-          return (
-            `需求澄清：有 ${pendingQuestions.length} 个问题需要确认\n` +
-            pendingQuestions.map((q, i) => `${i + 1}. [${q.priority}] ${q.question}`).join('\n')
-          );
-        }
-        return '需求澄清：请确认需求分析结果是否准确完整';
-      }
-      case 'API_CONFIRMATION':
-        return 'API 契约确认：方案已通过 AI 评审，请确认 API 接口定义是否正确（确认后进入编码）';
-      case 'DELIVERY_CONFIRMATION':
-        return '交付确认：请确认代码变更是否符合预期，是否创建 PR';
-      default:
-        return '请确认是否继续';
-    }
-  }
-
-  private async handleHumanAnswer(state: PipelineStateName, answer?: string): Promise<void> {
-    // REQUIREMENT_CLARIFICATION 走 handleClarificationFollowup（多轮澄清），不进入本方法。
-    // API_CONFIRMATION / DELIVERY_CONFIRMATION 的人工回答当前仅作为放行信号（直接推进）；
-    // 若未来需要保存人工对 API 契约/交付说明的修改，在此按 state 分别处理。
-    this.logger?.info(
-      `[Harness] 硬卡点 ${state} 收到人工确认${answer ? '（含回答内容，当前版本仅放行不消费）' : ''}`,
-    );
-  }
-
-  // ============================================================
   // 工具方法
   // ============================================================
-
-  /**
-   * 弱介入窗口调用：回调决策与超时竞速，超时自动 continue，避免流程无限等待。
-   * weakConfirmationTimeoutMs <= 0 时不超时，一直等待人工回调。
-   */
-  private async invokeWeakIntervention(
-    state: PipelineStateName,
-    artifact: unknown,
-  ): Promise<WeakInterventionDecision> {
-    if (!this.onWeakIntervention) return { action: 'continue' };
-
-    const decisionPromise = this.onWeakIntervention(state, {
-      instanceId: this.instanceId,
-      artifact,
-    });
-    if (this.weakConfirmationTimeoutMs <= 0) return decisionPromise;
-
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise<WeakInterventionDecision>((resolve) => {
-      timer = setTimeout(() => {
-        this.logger?.warn(
-          `[Harness] 弱介入窗口 ${this.weakConfirmationTimeoutMs}ms 内无决策，自动继续`,
-        );
-        resolve({ action: 'continue' });
-      }, this.weakConfirmationTimeoutMs);
-    });
-
-    try {
-      return await Promise.race([decisionPromise, timeoutPromise]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
 
   /** 回填产物对象内部的 instanceId 字段（若存在该字段） */
   private attachInstanceId(data: unknown): void {
@@ -1448,14 +849,6 @@ export class Harness {
   /** 单流程 token 预算（0 不限，issue #39 消费） */
   getTokenBudget(): number {
     return this.maxTokensPerRun;
-  }
-
-  /**
-   * 状态名转换为 stage 格式（kebab-case）
-   * REQUIREMENT_PARSING → requirement-parsing
-   */
-  private stateToStage(state: PipelineStateName): string {
-    return state.toLowerCase().replace(/_/g, '-');
   }
 
   private failExecution(message: string): HarnessExecutionResult {

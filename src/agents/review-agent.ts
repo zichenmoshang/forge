@@ -145,7 +145,7 @@ export class ReviewAgent extends BaseAgent<ReviewAgentInput, ReviewResult> {
 
   protected parseOutput(content: string, input: ReviewAgentInput): ReviewResult {
     const jsonStr = this.extractJsonObject(content);
-    const parsed: RawReview = JSON.parse(jsonStr);
+    const parsed = this.parseJsonWithRecovery<RawReview>(jsonStr);
     const now = new Date().toISOString();
     const round = input.round ?? 1;
     const isCodeReview = input.type === 'review-code';

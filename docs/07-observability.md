@@ -91,7 +91,8 @@ trace: inst_abc123 (总耗时 5min)
 
 每个 span 记录：阶段名、开始/结束时间、状态（成功/失败/回退/挂起）、输入摘要、输出产物路径、错误信息。
 
-v1 存在 PostgreSQL `spans` 表，通过 instance_id 查完整调用链。
+> ⚠️ **实现状态（#85 同步）**：目标态为 PostgreSQL `spans` 表按 instance_id 查完整调用链，v1 未实现——
+> 当前通过 `data/instances/{id}/logs/pipeline.log` 的时间线与产物版本链做人工溯源（Tracer 见实现状态表）。
 
 ## 第三层：指标
 
@@ -114,7 +115,8 @@ v1 存在 PostgreSQL `spans` 表，通过 instance_id 查完整调用链。
 
 ### 存储与展示
 
-v1 存 PostgreSQL `metrics` 表，流程结束时聚合写入。查看方式：
+> ⚠️ **实现状态（#85 同步）**：目标态为 PostgreSQL `metrics` 表流程结束聚合写入，v1 未实现——
+> 当前指标靠 Logger 输出（token 统计、阶段耗时）与流水线日志人工汇总。查看方式（目标态）：
 - CLI 命令：`forge stats --instance xxx`、`forge stats --overview`
 - 简单 HTML 统计页面（可选）
 
@@ -198,5 +200,6 @@ v1 存 PostgreSQL `metrics` 表，流程结束时聚合写入。查看方式：
 | 第二层：链路追踪 | Tracer（span 记录） | ⏳ 待实现（按需补充） |
 | 第三层：指标 | MetricsCollector | ⏳ 待实现（按需补充） |
 | 第四层：质量与成本分析 | 质量评估、成本追踪 | ⏳ 待实现（v1 后期） |
+| 预算控制（ADR-014 前置） | TokenBudgetTracker（#39） | ✅ 已实现：maxTokensPerRun / maxTokensPerCall，Agent 调用前后检查，超限暂停流程 |
 
 当前 Logger 已支持：分级输出（debug/info/warn/error）、JSON Lines 格式、LLM 调用完整 prompt/response 记录、按实例分文件（data/instances/{id}/logs/pipeline.log + llm-calls.log）、console + 文件双通道、写入失败 console.warn 降级。

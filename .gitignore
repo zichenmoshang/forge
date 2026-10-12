@@ -1,27 +1,26 @@
 # 依赖
 node_modules/
 dist/
-
 # 环境变量
 .env
 .env.local
-
 # 运行时数据
 data/instances/
 data/knowledge/
 data/projects/
 data/logs/
-
 # 编辑器
 .vscode/
 .idea/
 *.swp
 *.swo
-
 # 系统文件
 .DS_Store
 Thumbs.db
-
 # 临时文件
 git-push.bat
 git-push.log
+# TDD 临时沙箱（#83 子进程测试工作区）
+.sandbox/
+.tmp/
+output/

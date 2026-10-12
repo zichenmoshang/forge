@@ -86,7 +86,7 @@ export const observabilityConfigSchema = z.object({
 });
 
 // 向量模型配置（知识库嵌入）
-const embeddingProviderSchema = z.enum(['qwen', 'mock']);
+const embeddingProviderSchema = z.enum(['qwen', 'openai', 'mock']);
 export type EmbeddingProviderType = z.infer<typeof embeddingProviderSchema>;
 
 export const embeddingConfigSchema = z.object({
@@ -103,11 +103,22 @@ export const knowledgeBaseConfigSchema = z.object({
   rerankEnabled: booleanFromString.default(false),
 });
 
-// 飞书文档同步配置（v2）
+// 飞书文档同步配置
 export const feishuConfigSchema = z.object({
+  /** 飞书应用 App ID */
   appId: z.string().default(''),
+  /** 飞书应用 App Secret */
   appSecret: z.string().default(''),
+  /** 要同步的 Wiki 空间 ID 列表，逗号分隔 */
   wikiSpaceIds: z.string().default(''),
+  /** 是否启用飞书文档同步，默认 false（需配置 appId/appSecret 后开启） */
+  syncEnabled: booleanFromString.default(false),
+  /** 文档分块最大字符数，默认 1000 */
+  chunkMaxChars: z.coerce.number().int().positive().default(1000),
+  /** 文档分块重叠字符数，默认 100 */
+  chunkOverlapChars: z.coerce.number().int().nonnegative().default(100),
+  /** 同步时的项目范围，默认 'global' */
+  projectScope: z.string().default('global'),
 });
 
 // 交付阶段配置（阶段7：代码落盘 + Git + 构建验证 + PR）
@@ -184,6 +195,10 @@ export const forgeConfigSchema = z.object({
     appId: '',
     appSecret: '',
     wikiSpaceIds: '',
+    syncEnabled: false,
+    chunkMaxChars: 1000,
+    chunkOverlapChars: 100,
+    projectScope: 'global',
   }),
   delivery: deliveryConfigSchema.default({
     targetProjectPath: './target-project',

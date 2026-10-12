@@ -200,7 +200,7 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
   }
 
   protected parseOutput(content: string): RedTddOutput {
-    const parsed = JSON.parse(this.extractJsonObject(content)) as RawRedOutput;
+    const parsed = this.parseJsonWithRecovery<RawRedOutput>(this.extractJsonObject(content));
     const testFiles = normalizeFiles(parsed.testFiles, 'test');
     const mockFiles = normalizeFiles(parsed.mockFiles, 'mock');
     const acTestMapping: Record<string, string[]> = {};
@@ -260,7 +260,7 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
   }
 
   private parseGreenOutput(content: string): GreenTddOutput {
-    const parsed = JSON.parse(this.extractJsonObject(content)) as RawGreenOutput;
+    const parsed = this.parseJsonWithRecovery<RawGreenOutput>(this.extractJsonObject(content));
     return {
       implFiles: normalizeFiles(parsed.implFiles, 'component'),
       updatedTestFiles: normalizeFiles(parsed.updatedTestFiles, 'test'),
@@ -567,7 +567,7 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
 
   private parseReviseOutput(content: string, input: CodeReviseInput): CodeRevision {
     const jsonStr = this.extractJsonObject(content);
-    const parsed: RawCodeReviseOutput = JSON.parse(jsonStr);
+    const parsed = this.parseJsonWithRecovery<RawCodeReviseOutput>(jsonStr);
     // normalizeFiles 默认类型为 component；若 LLM 未显式指定 type，则按路径推断测试文件
     const updatedFiles = normalizeFiles(parsed.updatedFiles, 'component').map((f) => {
       if (f.type !== 'component') return f; // LLM 已指定类型，不覆盖

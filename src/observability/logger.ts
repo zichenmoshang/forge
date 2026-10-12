@@ -53,6 +53,8 @@ export interface LLMCallLog {
   totalTokens: number;
   durationMs: number;
   success: boolean;
+  /** 结束原因：stop（正常结束）、length（达到 max_tokens 截断）、content_filter（内容过滤）等 */
+  finishReason?: string;
   error?: string;
 }
 

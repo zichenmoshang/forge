@@ -287,13 +287,13 @@ describe('DesignAgent.generate', () => {
     expect(result.success).toBe(true);
   });
 
-  it('页面引用不存在的组件时报 BROKEN_COMPONENT_REF', async () => {
+  it('页面引用不存在的组件时报 BROKEN_COMPONENT_REF warning（不阻断，#81 放宽校验）', async () => {
     const obj = validDesignObject();
     obj.pages[0].componentIds = ['c-not-exist'];
     const llm = createMockLLM(JSON.stringify(obj));
     const agent = new DesignAgent(llm, { config: { maxRetries: 0, retryBaseDelayMs: 10 } });
     const result = await agent.execute(makeContext());
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true); // warning 不阻断
     expect(result.errors.some((e) => e.code === 'BROKEN_COMPONENT_REF')).toBe(true);
   });
 
@@ -307,13 +307,13 @@ describe('DesignAgent.generate', () => {
     expect(result.errors.some((e) => e.code === 'NO_COMPONENTS')).toBe(true);
   });
 
-  it('缺少状态管理划分原则时报错', async () => {
+  it('缺少状态管理划分原则时报 NO_STATE_MANAGEMENT_PRINCIPLE warning（不阻断，#81 放宽校验）', async () => {
     const obj = validDesignObject();
     obj.stateManagement.principle = '';
     const llm = createMockLLM(JSON.stringify(obj));
     const agent = new DesignAgent(llm, { config: { maxRetries: 0, retryBaseDelayMs: 10 } });
     const result = await agent.execute(makeContext());
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true); // warning 不阻断
     expect(result.errors.some((e) => e.code === 'NO_STATE_MANAGEMENT_PRINCIPLE')).toBe(true);
   });
 

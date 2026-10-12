@@ -135,12 +135,108 @@ export class QwenEmbeddingProvider implements EmbeddingProvider {
 }
 
 /**
+ * OpenAI 兼容 Embedding Provider
+ *
+ * 调用任何兼容 OpenAI Embedding API 的服务（火山引擎、OpenAI、本地部署等）。
+ * 文档：https://platform.openai.com/docs/api-reference/embeddings
+ *
+ * 特殊支持：火山引擎 Doubao-embedding-vision 多模态模型只支持 /embeddings/multimodal API，
+ * 当模型名包含 "vision" 时自动切换到多模态 API 格式。
+ */
+export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+  readonly name = 'openai-embedding';
+  private config: EmbeddingConfig;
+
+  constructor(config: EmbeddingConfig) {
+    this.config = config;
+  }
+
+  /**
+   * 判断是否为多模态向量化模型（如 doubao-embedding-vision）
+   * 多模态模型只支持 /embeddings/multimodal API，不支持标准 /embeddings API
+   */
+  private isMultimodalModel(model: string): boolean {
+    return model.toLowerCase().includes('vision');
+  }
+
+  async embed(request: EmbeddingRequest): Promise<EmbeddingResponse> {
+    const startTime = Date.now();
+    const inputs = Array.isArray(request.input) ? request.input : [request.input];
+    const model = request.model || this.config.model;
+
+    const baseUrl = this.config.baseUrl || 'https://api.openai.com/v1';
+    const useMultimodal = this.isMultimodalModel(model);
+    const url = useMultimodal ? `${baseUrl}/embeddings/multimodal` : `${baseUrl}/embeddings`;
+
+    // 多模态 API 的 input 格式是对象数组，标准 API 是字符串数组
+    const requestBody = useMultimodal
+      ? {
+          model,
+          input: inputs.map((text) => ({ type: 'text', text })),
+        }
+      : {
+          model,
+          input: inputs,
+        };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.config.apiKey}`,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI Embedding API 错误 (${response.status}): ${errorText}`);
+    }
+
+    if (useMultimodal) {
+      // 多模态 API 响应格式：data 是单个对象 { embedding, object }，不是数组
+      const data = (await response.json()) as {
+        data?: { embedding: number[]; object?: string };
+        usage?: { prompt_tokens?: number; total_tokens?: number };
+        model?: string;
+      };
+      const embedding = data.data?.embedding;
+      const embeddings: number[][] = embedding ? [embedding] : [];
+
+      return {
+        embeddings,
+        model: data.model || model,
+        promptTokens: data.usage?.prompt_tokens ?? data.usage?.total_tokens,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    // 标准 OpenAI 兼容 API 响应格式：data 是数组 [{ embedding, index, object }]
+    const data = (await response.json()) as {
+      data?: Array<{ embedding: number[] }>;
+      usage?: { total_tokens?: number; prompt_tokens?: number };
+      model?: string;
+    };
+    const embeddings: number[][] = data.data?.map((item) => item.embedding) ?? [];
+
+    return {
+      embeddings,
+      model: data.model || model,
+      promptTokens: data.usage?.total_tokens ?? data.usage?.prompt_tokens,
+      durationMs: Date.now() - startTime,
+    };
+  }
+}
+
+/**
  * Embedding Provider 工厂方法
  */
 export function createEmbeddingProvider(config: EmbeddingConfig): EmbeddingProvider {
   switch (config.provider) {
     case 'qwen':
       return new QwenEmbeddingProvider(config);
+    case 'openai':
+      return new OpenAIEmbeddingProvider(config);
     case 'mock':
       return new MockEmbeddingProvider(config.dimensions);
     default:

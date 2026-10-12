@@ -205,7 +205,7 @@ Reviewer 和 Designer 在本阶段内进行多轮对话，直到通过或达到�
 
 ### 阶段5：TDD 代码生成
 
-> ✅ **v1 已实现（方案丙：可替换工具层）**：CodingAgent 对单故事执行 red（只产测试+mock，工作区内运行且必须失败，反假测试）→ green（产最小实现转绿，失败在 maxGreenAttempts=5 内带失败信息修复）；Harness.runCodingPhase 按依赖拓扑逐故事编排、单故事失败不阻塞、聚合 CodingPhaseResult 并按 all-success/partial/all-failed 三分支出口（#40）。工具层为接口抽象：v1 默认 InMemoryWorkspace + StaticTestRunner（依据文件齐备性/AC 引用/用例计数**静态推断** TestResult，明确标注"未真实执行测试命令"，符合"测试到 mock 级"）；ScriptableTestRunner 供测试编排红绿；真实子进程 vitest runner（LocalSubprocessTestRunner，真正 red/green）为 v2 可替换实现，编排逻辑无需改动。代码全文暂存于 GeneratedFile.content，真实落盘随交付阶段。
+> ✅ **v1 已实现（方案丙：可替换工具层）**：CodingAgent 对单故事执行 red（只产测试+mock，工作区内运行且必须失败，反假测试）→ green（产最小实现转绿，失败在 maxGreenAttempts=5 内带失败信息修复）；Harness.runCodingPhase 按依赖拓扑逐故事编排、单故事失败不阻塞、聚合 CodingPhaseResult 并按 all-success/partial/all-failed 三分支出口（#40）。工具层为接口抽象：CLI 默认 **LocalSubprocessTestRunner（#83 已落地）**——把工作区落盘到项目 `.sandbox/` 临时目录，真实调用 vitest 子进程执行，解析 JSON 输出还原真实通过/失败/失败原因（red 无实现 → 真实 import 解析失败；假测试不引用实现 → 真实全绿被 RED_SHOULD_FAIL 拦截；实现有 bug → 真实断言错误信息回流给修复循环）。vitest 不可用/超时时自动降级 StaticTestRunner（静态推断并明确标注"降级静态推断"；fallbackToStatic=false 则返回环境失败）。`--test-mode static` 可显式切回静态推断快速通道。代码全文暂存于 GeneratedFile.content，真实落盘随交付阶段。
 
 **输入**：技术方案 + 用户故事 AC + API 契约
 
@@ -363,7 +363,7 @@ Reviewer 和 Designer 在本阶段内进行多轮对话，直到通过或达到�
 | 评审暂停/续跑与兜底 | ✅ 已实现 | request_human / 达最大轮次 → 停在 DESIGN_REVIEWING 等人工；resume 续跑或人工放行；interruptAfterEachRound 每轮弱介入；方案重生成清空旧评审 |
 | 阶段5 逐故事 TDD 编码 | ✅ 已实现 | CodingAgent red/green 循环、AC 测试覆盖程序校验、CodingPhaseResult 聚合；工具层可替换 |
 | 编码部分成功出口 #40 | ✅ 已实现 | 拓扑逐故事、单故事失败隔离继续；all-success 进 CR、partial 弱介入（带失败继续/回退）、all-failed FAILED；needsDesignFallback 透传方案性问题 |
-| 真实子进程跑测试 | ⏳ v2 | 当前 StaticTestRunner 静态推断（标注未真实执行），LocalSubprocessTestRunner 随后替换，编排不变 |
+| 真实子进程跑测试 | ✅ v1 | LocalSubprocessTestRunner（#83）：工作区落盘 .sandbox 真实跑 vitest、解析 JSON、失败降级静态并标注；`--test-mode static` 可显式切换旧静态通道 |
 | 代码 CR 多轮对话 | ✅ 已实现 | ReviewAgent review-code 分支 + CodingAgent.revise + Harness.runCodeReviewDialog，复用 #42 模式，阻塞问题触发修订、verification 闭环、暂停/续跑/最大轮次 |
 | 设计还原度图片比对 | ⏳ v2 | v1 仅文本维度核对组件结构/样式类名，Figma 截图比对留 v2 |
 | 编码方案性问题自动回退 | 🟡 部分 | Agent 已产出 needsDesignFallback/fallbackReason；CR 中 category=design 的问题经弱介入人工决定回退 |

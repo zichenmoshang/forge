@@ -190,27 +190,20 @@ export function renderDesignReviseUserPrompt(vars: DesignRevisePromptVars): stri
 ## 上一轮评审问题（必须逐项回应）
 ${issueText || '（无）'}
 
-请输出严格 JSON：
-{
-  "changeSummary": "本次修改的总体说明",
-  "changedSections": ["被修改的页面/组件/章节ID"],
-  "issueResponses": [
-    { "issueId": "与上面对应", "action": "fixed|wont-fix|needs-discussion", "explanation": "处理说明或不修复理由" }
-  ],
-  "updatedDesign": {
-    "techStack": { "source": "suggested", "framework": {"name":"","version":""}, "language": "TypeScript", "stateManagement": {"library":""}, "testing": {"framework":""}, "buildTool": "" },
-    "figmaReference": { "available": false, "frames": [], "componentMappings": [] },
-    "pages": [],
-    "componentTree": [],
-    "stateManagement": { "principle": "", "globalStores": [] },
-    "dataModels": [],
-    "apiContracts": [],
-    "exceptionScenarios": [],
-    "nfrSolutions": [],
-    "reusableComponents": [],
-    "directoryStructure": { "name": "src", "type": "directory", "path": "src" }
-  }
-}
+【输出要求 — 增量模式，不要输出完整方案】
+只输出以下部分：
+1. changeSummary（必填）：本次修改的总体说明
+2. changedSections（必填）：被修改的页面/组件/章节 ID 列表
+3. issueResponses（必填）：对上一轮每个 open 问题的逐项回应
+4. updates（可选）：只有当评审问题导致方案内容实际变更时才输出。包含需要更新的字段（如 pages、componentTree、apiContracts、stateManagement 等），每个字段输出完整的更新后数组/对象。如果没有内容变更，不要输出 updates。
 
-注意：updatedDesign 必须是修改后的完整方案，字段结构与首次生成完全一致；coverageCheck、apiConfirmation、id/version/时间戳由系统重算，不要输出。`;
+示例（仅修改了 componentTree 和 apiContracts）：
+{"changeSummary": "修复了用户组件的 props 定义，新增了登录 API", "changedSections": ["c-user-login", "api-login"], "issueResponses": [{"issueId": "I-001", "action": "fixed", "explanation": "已修复"}], "updates": {"componentTree": [{"id": "c-user-login", ...}, ...], "apiContracts": [{"id": "api-login", ...}, ...]}}
+
+输出严格 JSON，不要包含解释性文字。
+
+注意：
+- updates 中只包含有变更的字段，未变更的字段不要输出（系统会自动沿用上一版）
+- 如果某个字段有变更，输出该字段的完整更新后内容（不是 diff）
+- coverageCheck、apiConfirmation、id/version/时间戳由系统重算，不要输出`;
 }

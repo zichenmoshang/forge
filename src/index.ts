@@ -12,7 +12,8 @@ export * from './services';
 export { getConfig, loadConfig } from './config';
 export type { ForgeConfig, LLMConfig } from './config';
 import { runKnowledgeCli } from './cli/knowledge-cli';
-export { runKnowledgeCli };
+import { runForgeCli } from './cli/run-cli';
+export { runKnowledgeCli, runForgeCli };
 
 // CLI 入口
 if (require.main === module) {
@@ -24,13 +25,19 @@ if (require.main === module) {
       console.error('知识库命令执行失败:', err);
       process.exit(1);
     });
+  } else if (args[0] === 'run') {
+    // 主流程流水线
+    runForgeCli(args.slice(1)).catch((err) => {
+      console.error('流水线执行失败:', err);
+      process.exit(1);
+    });
   } else {
     console.log('Forge - 需求到代码自动化智能体');
     console.log('');
     console.log('用法:');
-    console.log('  forge kb <command>  知识库维护（sync/rebuild/search/status）');
-    console.log('  forge run <prd-path>  运行需求流水线（TODO）');
+    console.log('  forge run <prd-path>  运行需求流水线');
+    console.log('  forge kb <command>    知识库维护（sync/rebuild/search/status）');
     console.log('');
-    console.log('运行 "forge kb help" 查看知识库命令帮助');
+    console.log('运行 "forge run --help" 或 "forge kb help" 查看帮助');
   }
 }

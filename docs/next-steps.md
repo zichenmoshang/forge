@@ -2,7 +2,10 @@
 
 ## 当前状态
 
-设计阶段完成，工程基础设施已搭建，核心模块、Agent 基类、需求分析 Agent、方案设计 Agent、方案评审 Agent（含方案多轮+代码 CR 多轮）、编码 Agent（单故事 TDD + 逐故事循环 + 部分成功出口 + CR 内 revise）、交付 Agent（场景判定+新项目初始化+代码落盘+构建验证+Git+PR描述）、Harness、ContextManager、知识库基础设施、可替换编码工具层（Workspace/TestRunner）、可替换交付工具层（FileSystem/Git/Build）、评审统一判定规则、需求冻结质量门、方案覆盖度、编码规划/聚合/校验纯函数已实现。共 315 个测试全部通过（交付 Agent 落地后）。
+设计阶段完成，工程基础设施已搭建，核心模块、Agent 基类、需求分析 Agent、方案设计 Agent、方案评审 Agent（含方案多轮+代码 CR 多轮）、编码 Agent（单故事 TDD + 逐故事循环 + 部分成功出口 + CR 内 revise）、交付 Agent（场景判定+新项目初始化+代码落盘+构建验证+Git+PR描述）、Harness、ContextManager、知识库基础设施（含飞书文档同步）、可替换编码工具层（Workspace/TestRunner + 真实子进程执行 #83）、可替换交付工具层（FileSystem/Git/Build）、评审统一判定规则、需求冻结质量门、方案覆盖度、编码规划/聚合/校验纯函数已实现。共 370 个测试全部通过（28 文件）。
+
+**最近完成批次（2026-10）**：#81 技术方案校验放宽（error→warning）、#39 预算控制落地（TokenBudgetTracker）、#82 状态持久化（FileSystemArtifactStore + state.json + `--resume`）、#83 真实测试执行（LocalSubprocessTestRunner，CLI 默认，失败降级静态）。
+**待办高优先级**：#47 Harness 拆分瘦身、#84 知识库质量与单例问题、#85 文档同步（本批已执行）、#86 弱介入窗口设计、#38 回退成本预警。
 
 ## 已完成
 
@@ -13,9 +16,9 @@
 - [x] Harness + 专业 Agent 架构设计
 - [x] 知识库方案（代码反解析 + RAG + 无人工打标）
 - [x] 知识库检索与维护机制（混合检索、增量更新、五层质量保证、飞书文档集成）
-- [x] 向量模型选型（通义 Qwen3-Embedding，1024 维）
+- [x] 向量模型选型（火山引擎 Doubao-embedding-vision-251215，2048 维，OpenAI 兼容接口，支持 qwen/openai/mock 可插拔）
 - [x] 现有代码索引方案
-- [x] 存储方案（PostgreSQL + pgvector + 文件系统）
+- [x] 存储方案（目标态 PostgreSQL + pgvector + 文件系统；v1 实际：文件系统 + 内存向量库，见 06-storage.md）
 - [x] 可观测性方案（四层体系，含事前预算控制设计）
 - [x] 评审多轮对话机制设计（08-review-dialog.md）
 - [x] 关键决策记录（14 条 ADR，最新 ADR-014 第六轮架构审查）
@@ -125,14 +128,15 @@ v1 需要使用知识库验证 Harness 和 DesignAgent 的正确性，因此知�
 
 - [x] KnowledgeService（单例，核心接口：search/indexCode/indexDocument/getStatus/updateWeight/rebuild）
 - [x] VectorStore（内存版 InMemoryVectorStore，预留 pgvector 实现接口）
-- [x] EmbeddingProvider（Qwen API 实现 + Mock 确定性伪向量，工厂方法）
+- [x] EmbeddingProvider（Qwen API 实现 + OpenAI 兼容实现（火山 Doubao-embedding）+ Mock 确定性伪向量，工厂方法）
 - [x] ASTParser（TypeScript Compiler API，提取 API 接口和组件 props）
 - [x] BaseAgent retrieveKnowledge 钩子 + searchKnowledge 多路检索 helper（ADR-014：检索由 Agent 内部通过 AgentContext.knowledgeService 自主完成，ContextManager 不预检索）
-- [x] 知识库维护 CLI（kb sync/rebuild/search/status）
-- [x] 配置扩展（embedding/knowledgeBase/feishu/budget 配置块）
-- [x] 单元测试（知识库相关测试覆盖检索、入库、状态、权重、重建 + searchKnowledge helper）
+- [x] 知识库维护 CLI（kb sync/rebuild/search/status/sync-feishu）
+- [x] 配置扩展（embedding/knowledgeBase/feishu/budget 配置块，飞书同步参数 syncEnabled/chunkMaxChars/chunkOverlapChars/projectScope）
+- [x] 飞书文档同步（FeishuClient 认证+Wiki+文档获取、DocChunker 标题→段落→字符三级分块、FeishuSyncService 拉取→筛选→分块→入库，支持 Docx/Doc、多空间、项目范围隔离）
+- [x] 单元测试（知识库相关测试覆盖检索、入库、状态、权重、重建 + searchKnowledge helper + 飞书同步 30 个测试）
 - [ ] pgvector 持久化实现（当前内存版，v1 验证后切换）
-- [ ] 飞书文档同步（v2）
+- [ ] 飞书文档增量同步 + 定时同步（v2）
 - [ ] Rerank 重排序（v2）
 - [ ] RequirementAgent 知识库检索（v2）
 
@@ -170,7 +174,7 @@ v1 需要使用知识库验证 Harness 和 DesignAgent 的正确性，因此知�
 - [x] CodingAgent 单故事 TDD：red（测试+mock，必须失败反假测试）→ green/fix（maxGreenAttempts=5），AC 测试覆盖程序校验，needsDesignFallback 透传
 - [x] Harness.runCodingPhase：拓扑逐故事、单故事失败隔离、CodingPhaseResult 聚合、#40 三分支出口、完成后进入代码 CR 多轮
 - [x] CodingAgent.revise（CR 对话内针对性修改+重跑测试+逐项 issueResponses）
-- [ ] 真实子进程测试执行器（LocalSubprocessTestRunner，v2 替换 StaticTestRunner）
+- [x] 真实子进程测试执行器（LocalSubprocessTestRunner，#83：工作区落盘 .sandbox 真实跑 vitest、解析 JSON、失败降级静态并标注；`--test-mode static` 可显式切回静态快速通道）
 - [ ] 代码真实落盘（GeneratedFile.content → 目标项目，随交付阶段）
 
 ### 第八步：代码 CR 多轮对话（✅ 已完成，复用 #42 模式）
@@ -195,16 +199,18 @@ v1 需要使用知识库验证 Harness 和 DesignAgent 的正确性，因此知�
 - [x] 产物 delivery（DeliveryResult：交付状态/Git信息/PR描述/变更统计/构建结果/完成故事/未完成故事/已知风险/后续建议）
 - [x] 配置扩展（delivery.targetProjectPath/git/build）
 - [ ] 远程 PR 创建（GitHub/GitLab API，v2）
-- [ ] 真实子进程测试执行器（v2 替换 StaticTestRunner）
 
 ### 后续
 
-- 真实子进程测试执行器（v2）
-- 回退成本预警（#38）、预算前置检查（#39）
-- 飞书文档同步（v2）
+- #47 Harness 拆分瘦身（ExecutionScheduler + ReviewDialogRunner + CodingPhaseRunner，Harness 保留门面）
+- #84 知识库质量保证（多项目单例隔离、内容校验、过期检测）
+- #86 弱介入窗口与人工交互设计优化
+- #38 回退成本预警
+- 飞书文档增量同步 + 定时同步（v2）
 - Rerank（v2）
 - RequirementAgent 知识库检索（v2）
 - 远程 PR 创建（v2）
+- PostgreSQL + pgvector 持久化（v2，当前内存向量）
 
 ## 关键设计决策记录
 

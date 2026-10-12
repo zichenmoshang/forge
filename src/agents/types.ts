@@ -4,6 +4,7 @@
 
 import type { KnowledgeItem } from '../types/knowledge';
 import type { KnowledgeService } from '../services/knowledge-service';
+import type { TokenBudgetTracker } from '../core/token-budget';
 
 /**
  * 全局上下文（跨阶段始终携带的团队/项目约束）
@@ -40,6 +41,8 @@ export interface AgentContext {
   knowledgeService?: KnowledgeService;
   /** 当前项目 ID，知识库检索时用于 projectScope 过滤（当前项目 + global） */
   projectId?: string;
+  /** Token 预算跟踪器（由 Harness 注入，BaseAgent 在 LLM 调用前后检查/累计，issue #39） */
+  tokenBudget?: TokenBudgetTracker;
   /** 额外参数 */
   params?: Record<string, unknown>;
 }

@@ -6,6 +6,7 @@
  *   forge kb rebuild <repo-path...>
  *   forge kb search <query> [--type <type>] [--limit <n>]
  *   forge kb status
+ *   forge kb sync-feishu [--space <space-id>] [--scope <project-id>]
  *
  * 这些命令独立于 Harness 流程，直接调用 KnowledgeService。
  */
@@ -15,6 +16,7 @@ import { createEmbeddingProvider, MockEmbeddingProvider } from '../llm/embedding
 import { KnowledgeService } from '../services/knowledge-service';
 import { InMemoryVectorStore } from '../services/vector-store';
 import { ASTParser } from '../services/ast-parser';
+import { FeishuClient, FeishuSyncService } from '../integrations/feishu';
 import type { KnowledgeType } from '../types/knowledge';
 
 /** 初始化 KnowledgeService（CLI 用） */
@@ -178,6 +180,81 @@ export async function runKnowledgeCli(args: string[]): Promise<void> {
       break;
     }
 
+    case 'sync-feishu': {
+      const config = getConfig();
+
+      // 检查飞书配置
+      if (!config.feishu.appId || !config.feishu.appSecret) {
+        console.error('错误: 飞书应用未配置，请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET');
+        process.exit(1);
+      }
+
+      // 确定要同步的空间 ID
+      let spaceIds: string[] = [];
+      if (options.space) {
+        spaceIds = [options.space];
+      } else if (config.feishu.wikiSpaceIds) {
+        spaceIds = config.feishu.wikiSpaceIds
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+
+      if (spaceIds.length === 0) {
+        console.error(
+          '错误: 请指定 Wiki 空间 ID（--space <space-id>）或配置 FEISHU_WIKI_SPACE_IDS',
+        );
+        process.exit(1);
+      }
+
+      const projectScope = options.scope || config.feishu.projectScope;
+
+      console.log(`开始同步飞书 Wiki 文档:`);
+      console.log(`  空间 ID: ${spaceIds.join(', ')}`);
+      console.log(`  项目范围: ${projectScope}`);
+      console.log(`  分块大小: ${config.feishu.chunkMaxChars} 字符`);
+      console.log('');
+
+      // 初始化飞书客户端
+      const feishuClient = new FeishuClient({
+        appId: config.feishu.appId,
+        appSecret: config.feishu.appSecret,
+      });
+
+      // 初始化同步服务
+      const syncService = new FeishuSyncService({
+        client: feishuClient,
+        knowledgeService: service,
+        projectScope,
+        chunkConfig: {
+          maxChars: config.feishu.chunkMaxChars,
+          overlapChars: config.feishu.chunkOverlapChars,
+        },
+      });
+
+      // 执行同步
+      const result = await syncService.syncSpaces(spaceIds);
+
+      console.log(`\n同步完成:`);
+      console.log(`  扫描节点: ${result.totalNodes}`);
+      console.log(`  文档总数: ${result.totalDocuments}`);
+      console.log(`  成功块数: ${result.successChunks}`);
+      console.log(`  失败文档: ${result.failedDocuments}`);
+      console.log(`  跳过节点: ${result.skippedNodes}`);
+      console.log(`  耗时: ${(result.durationMs / 1000).toFixed(1)}s`);
+
+      if (result.errors.length > 0) {
+        console.log(`\n失败详情:`);
+        for (const err of result.errors.slice(0, 10)) {
+          console.log(`  - [${err.documentId}] ${err.title}: ${err.error}`);
+        }
+        if (result.errors.length > 10) {
+          console.log(`  ... 还有 ${result.errors.length - 10} 个错误`);
+        }
+      }
+      break;
+    }
+
     default:
       console.error(`未知命令: ${command}`);
       printHelp();
@@ -204,12 +281,18 @@ Forge 知识库维护 CLI
   forge kb status
     查看知识库状态统计
 
+  forge kb sync-feishu [--space <space-id>] [--scope <project-id>]
+    同步飞书 Wiki 文档到知识库
+    需配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET
+    不指定 --space 时使用 FEISHU_WIKI_SPACE_IDS 配置
+
   forge kb help
     显示此帮助信息
 
 示例:
   forge kb sync ./src --scope my-project --tech react
   forge kb search "用户登录 API" --type api
+  forge kb sync-feishu --space 7xxxxxxxxxxxx --scope my-project
   forge kb status
 `);
 }

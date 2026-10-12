@@ -439,7 +439,7 @@ defaultTemperature: Number(process.env.LLM_TEMPERATURE) || 0.7,
 **经验来源**：编码阶段（TDD 要"跑测试看红绿"，但 v1 让 LLM 一次生成可编译运行的真实前端项目成本高、脆弱）
 
 - 把外部不确定能力抽象成接口（Workspace 读写文件、TestRunner 跑测试），**编排逻辑（red→green→fix 循环、逐故事、出口判定）只依赖接口、保持真实且可单测**；易变的执行方式做成可替换实现
-- v1 用静态推断实现（StaticTestRunner 按文件齐备性/AC 引用/用例计数推断），必须在结果里**诚实标注"未真实执行"**（规范 1.9），不得伪装成真实跑过；测试用 ScriptableTestRunner 确定性编排红绿；真实子进程实现（v2）可直接替换而编排零改动
+- 测试执行实现（#83 已落地）：CLI 默认 **LocalSubprocessTestRunner** 真实调用 vitest 子进程（工作区落盘项目 `.sandbox/`，解析 JSON 输出还原真实通过/失败/失败原因，失败降级 StaticTestRunner 并明确标注"降级静态推断"）；静态推断实现（StaticTestRunner）仍保留，用于 `--test-mode static` 快速通道与降级兜底，其结果必须**诚实标注"静态推断/降级"**（规范 1.9），不得伪装成真实跑过；ScriptableTestRunner 确定性编排红绿单测
 - **TDD 的 red 必须真失败**：red 阶段只写测试不写实现，若缺实现时测试竟通过，说明是不依赖实现的"假测试"，作为质量门错误拦截（RED_SHOULD_FAIL）；mock 数据文件不算业务实现
 - 测试是否通过以 TestRunner 结果为准、每个可测试 AC 是否有测试以程序化映射校验，不采信 LLM 自报（规范 1.14）
 - **逐故事/跨条目循环与部分成功出口归 Harness**（流程控制层），单故事 Agent 只负责单故事 TDD、单故事失败不阻塞整体——这是规范 1.12 在批处理场景的延伸
