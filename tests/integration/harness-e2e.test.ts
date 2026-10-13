@@ -1202,4 +1202,129 @@ describe('Harness + Agent 端到端验证', () => {
       expect(accepted.waitingForHuman).toBe(true);
     });
   });
+
+  // ============================================================
+  // 12. 交付确认 → COMPLETED 终态（段 4 闭环）
+  // ============================================================
+  describe('12. 交付确认 → COMPLETED（段 4 闭环）', () => {
+    const RED = JSON.stringify({
+      testFiles: [
+        {
+          path: 'src/Login.test.ts',
+          type: 'test',
+          operation: 'create',
+          summary: '登录测试',
+          content:
+            "describe('Login', () => { it('ac1 正常登录', () => {}); it('ac2 错误密码', () => {}) })",
+          relatedAcIds: ['ac1', 'ac2'],
+        },
+      ],
+      mockFiles: [
+        {
+          path: 'src/api/login.mock.ts',
+          type: 'mock',
+          operation: 'create',
+          summary: '登录mock',
+          content: 'export const m = 1',
+        },
+      ],
+      acTestMapping: { ac1: ['ac1 正常登录'], ac2: ['ac2 错误密码'] },
+    });
+
+    const GREEN = JSON.stringify({
+      implFiles: [
+        {
+          path: 'src/Login.tsx',
+          type: 'component',
+          operation: 'create',
+          summary: '登录实现',
+          content: 'export const Login = () => null',
+          relatedAcIds: ['ac1', 'ac2'],
+        },
+      ],
+      updatedTestFiles: [],
+      needsDesignFallback: false,
+      fallbackReason: '',
+    });
+
+    const CR_PASS = JSON.stringify({
+      conclusion: 'pass',
+      summary: '代码质量良好',
+      issues: [],
+      checklist: {
+        designConsistency: { passed: true, mismatches: [] },
+        codeStyle: { passed: true, issues: [] },
+        logic: { passed: true, issues: [] },
+        exceptionHandling: { passed: true, missingHandling: [] },
+        security: { passed: true, vulnerabilities: [] },
+        maintainability: { passed: true, issues: [] },
+        duplication: { passed: true, duplicatedBlocks: [] },
+        testQuality: { passed: true, uncoveredAcs: [] },
+        designFidelity: { passed: true, mismatches: [] },
+        overallPassed: true,
+      },
+    });
+
+    it('交付确认硬卡点 resume 后推进到 COMPLETED，delivery 产物已保存', async () => {
+      const { provider, calls } = createMockLLM([
+        CLARIFICATION_JSON,
+        FOLLOWUP_JSON,
+        STORY_JSON,
+        DESIGN_JSON,
+        REVIEW_JSON,
+        RED,
+        GREEN,
+        CR_PASS,
+      ]);
+      const harness = new Harness({ agents: createFullAgents(provider) });
+
+      await harness.start(SAMPLE_PRD);
+      const atApi = await harness.resume('确认澄清');
+      expect(atApi.finalState).toBe('API_CONFIRMATION');
+
+      const atDelivery = await harness.resume('API 已确认');
+      expect(atDelivery.finalState).toBe('DELIVERY_CONFIRMATION');
+      expect(atDelivery.waitingForHuman).toBe(true);
+
+      // 段 4：交付确认 → COMPLETED
+      const completed = await harness.resume('确认交付');
+      expect(completed.success).toBe(true);
+      expect(completed.finalState).toBe('COMPLETED');
+      expect(completed.waitingForHuman).toBe(false);
+
+      // delivery 产物已保存且成功
+      const delivery = harness.getArtifact<DeliveryResult>('delivery');
+      expect(delivery).toBeDefined();
+      expect(delivery?.status).toBe('success');
+
+      // LLM 调用：澄清/followup/故事/方案/评审 + red + green + CR = 8（delivery 为 mock 不调用 LLM）
+      expect(calls).toHaveLength(8);
+    });
+
+    it('终态 COMPLETED 后再次 resume 不重复执行，返回终态', async () => {
+      const { provider } = createMockLLM([
+        CLARIFICATION_JSON,
+        FOLLOWUP_JSON,
+        STORY_JSON,
+        DESIGN_JSON,
+        REVIEW_JSON,
+        RED,
+        GREEN,
+        CR_PASS,
+      ]);
+      const harness = new Harness({ agents: createFullAgents(provider) });
+
+      await harness.start(SAMPLE_PRD);
+      await harness.resume('确认澄清');
+      await harness.resume('API 已确认');
+      const completed = await harness.resume('确认交付');
+      expect(completed.finalState).toBe('COMPLETED');
+
+      // 终态非 waiting_human，resume 应被拒绝且不改变状态
+      const again = await harness.resume('再次确认');
+      expect(again.success).toBe(false);
+      expect(again.finalState).toBe('COMPLETED');
+      expect(again.message).toContain('不是等待人工介入');
+    });
+  });
 });
