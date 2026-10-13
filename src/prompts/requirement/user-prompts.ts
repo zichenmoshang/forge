@@ -3,11 +3,35 @@
  */
 
 import type { StructuredRequirement } from '../../types/requirement';
+import type { KnowledgeItem } from '../../types/knowledge';
+
+/**
+ * 将检索到的知识条目格式化为可注入 prompt 的"团队知识库参考"段落（无条目返回空串）。
+ * 优先用 summary（更短），回退 content；最多注入 8 条，避免 prompt 膨胀。
+ */
+export function formatKnowledgeSection(knowledge?: KnowledgeItem[]): string {
+  if (!knowledge || knowledge.length === 0) return '';
+  const body = knowledge
+    .slice(0, 8)
+    .map((k, i) => {
+      const text = (k.summary || k.content || '').trim();
+      return `[${i + 1}]（${k.type}${k.title ? ` · ${k.title}` : ''}）\n${text}`;
+    })
+    .join('\n\n');
+  return `团队知识库参考（遵循其中的团队规范与既有约定；若与上面需求冲突，以需求为准并在澄清问题中提出）：
+"""
+${body}
+"""
+
+`;
+}
 
 /** 需求澄清阶段的用户提示词变量 */
 export interface ClarificationPromptVars {
   source: string;
   prdText: string;
+  /** 检索到的团队知识（飞书 wiki / 历史规范），可选 */
+  knowledge?: KnowledgeItem[];
 }
 
 /** 渲染需求澄清用户提示词 */
@@ -21,7 +45,7 @@ PRD 内容：
 ${vars.prdText}
 """
 
-请按以下结构输出 JSON：
+${formatKnowledgeSection(vars.knowledge)}请按以下结构输出 JSON：
 {
   "meta": { "title": "", "source": "", "version": "" },
   "businessGoals": [{ "id": "", "description": "", "priority": "P0|P1|P2", "successMetrics": [] }],
@@ -38,12 +62,15 @@ ${vars.prdText}
 - clarificationLog 中列出所有需要澄清的问题，status 统一为 "pending"
 - 如果发现全局需求缺失，在 globalRequirements 中标记 source: "new", discoveredInClarification: true
 - 非功能需求如果 PRD 中没有明确说明，也要列出常见的并标记需要确认
+- 结合团队知识库：按其中规范识别缺失项（如登录权限、错误监控、状态管理约定）
 - frozen 字段由系统后续填充，不需要输出`;
 }
 
 /** 用户故事拆解阶段的用户提示词变量 */
 export interface StoryPromptVars {
   requirement: StructuredRequirement;
+  /** 检索到的团队知识（组件/模式/历史故事），可选 */
+  knowledge?: KnowledgeItem[];
 }
 
 /** 渲染用户故事拆解用户提示词 */
@@ -81,7 +108,7 @@ ${rules}
 非功能需求：
 ${nfrs}
 
-请按以下结构输出 JSON（只输出 stories，不要其他字段）：
+${formatKnowledgeSection(vars.knowledge)}请按以下结构输出 JSON（只输出 stories，不要其他字段）：
 {
   "stories": [{
     "id": "s1",
@@ -101,6 +128,7 @@ ${nfrs}
 - 每个故事**恰好 2 条**验收标准（1 条正常 + 1 条异常/边界），不要多也不要少
 - 验收标准用简洁的自然语言描述（Given/When/Then 格式），不要嵌套结构
 - description 的 action/benefit 各 1 句话，不要冗长
+- 参考团队知识库中的既有组件与模式，保持拆分粒度与命名一致
 - 只输出 stories 数组，不要输出 storyMap、nfrMapping、qualityCheck 等其他字段
 - 输出简洁，避免冗余描述`;
 }

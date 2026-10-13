@@ -147,14 +147,14 @@ Harness 本质是一个状态机执行器。整个流程建模为状态机，每
 #### 交付 Agent（阶段7）
 
 **职责**：
-- Git 操作（创建分支、提交）
 - 代码落地（新项目初始化/新模块新增/现有代码修改）
+- 新项目初始化前：结合知识库经验给出技术栈推荐，反问人工确认（`requestHumanInput`，直接回车采用推荐）
+- Git 操作（本地 init/分支/add/commit；v1 不远程推送、不集成 GitHub API）
 - 构建验证
-- PR 描述自动生成
-- PR 创建
+- PR 描述自动生成（随产物交付，人工据此发起 PR）
 
 **输入**：通过 CR 的代码、技术方案、用户故事
-**输出**：PR 链接
+**输出**：交付执行状态 + PR 描述（v1 不返回远程 PR 链接）
 
 ## 基础设施层
 
@@ -185,7 +185,6 @@ Agent 之下是统一的基础设施层，所有 Agent 通过这层访问外部�
 > ⚠️ **实现状态**：v1 存储层为「本地文件系统 + 内存向量库」——产物/状态/日志落盘
 > `data/instances/{id}/`（FileSystemArtifactStore + `state.json` 快照，#82 已实现，`--resume` 恢复），
 > 向量为 InMemoryVectorStore（#84 前置：重启丢失，pgvector 持久化为 v2 目标）。
-```
 
 ### LLM Provider 层
 
@@ -193,7 +192,8 @@ Agent 之下是统一的基础设施层，所有 Agent 通过这层访问外部�
 - 多模型实现（OpenAI、Anthropic、本地模型等）
 - 配置化切换，不硬编码模型
 - 自动记录每次调用的完整 prompt、response、token、耗时
-- 支持重试、超时、降级（大模型失败时切小模型）
+- 支持重试、超时（`llm.timeoutMs` 可配置，默认 10 分钟）与熔断
+  （`CircuitBreaker`：连续失败达阈值快速失败、冷却后半开试探，issue #62）
 
 ### Tool Layer
 
@@ -330,12 +330,12 @@ parseOutput → validateOutput → selfCheck
 
 | Agent | retrieveKnowledge | 检索内容 | 检索时机 |
 |---|---|---|---|
-| RequirementAgent（clarify） | ✅ v2 | 历史澄清问题、全局需求清单、技术规范 | 阶段开始时一次 |
-| RequirementAgent（stories） | ✅ v2 | 历史故事结构、AC 写法模式 | 阶段开始时一次 |
+| RequirementAgent（clarify） | ✅ 已实现 | PRD 相关规范、全局需求清单、历史澄清模式 | 阶段开始时一次 |
+| RequirementAgent（stories） | ✅ 已实现 | 组件/模式、历史故事结构、AC 写法、异常场景 | 阶段开始时一次（分批各检索） |
 | DesignAgent | ✅ 已实现 | 组件/模式、API/模型、规范/异常三路并行 | **Agent 内部按需多路检索（retrieveKnowledge）** |
-| CodingAgent | ✅ v1 | 代码模式、异常处理模式、组件用法 | Agent 内部按需检索 |
+| CodingAgent | ✅ 已实现 | 代码模式、异常处理模式、组件用法 | Agent 内部按需检索 |
 | ReviewAgent | ✅ 已实现（不检索） | 评审对照被评审产物即可，v1 不查知识库 | - |
-| DeliveryAgent | ❌ | 交付不需要检索知识库 | - |
+| DeliveryAgent | ✅ 已实现 | 仅新项目初始化时检索技术栈/脚手架约定作为推荐依据 | 新项目分支一次 |
 
 **设计决策（ADR-014 最终版）**：知识库检索**完全由 Agent 内部控制**——检索时机、query 构造、分几路检索都是 Agent 的业务逻辑。ContextManager **不做任何知识库检索**，只负责从产物存储装配上游产物；KnowledgeService 通过 `AgentContext.knowledgeService` 注入，BaseAgent 提供 `searchKnowledge()` helper 封装多路并行检索、projectScope 过滤和按 id 去重。这样避免"ContextManager 预检索 + Agent 再检索"的重复与职责重叠。
 
@@ -396,7 +396,7 @@ v1 需要实现知识库基础设施，用于验证 Harness 和 DesignAgent 的�
 - ✅ 知识库维护 CLI（sync/rebuild/search/status）
 - ✅ 飞书文档同步（FeishuSyncService，全量+增量、自动同步+手动全量；v1 已落地，见 docs/04-knowledge-base.md）
 - ❌ Rerank（v2，v1 用 top K 直接注入）
-- ❌ RequirementAgent 知识库检索（v2）
+- ✅ RequirementAgent 知识库检索（澄清/故事拆解，第二十一轮落地）
 - ❌ 权重反馈闭环（v2，v1 权重只有初始值）
 
 ## 上下文管理策略
@@ -431,7 +431,7 @@ v1 需要实现知识库基础设施，用于验证 Harness 和 DesignAgent 的�
    - ~~LLM Provider（OpenAI 实现 + 重试 + 日志）~~ ✅ 已完成
    - ~~结构化 Logger（按实例分文件）~~ ✅ 已完成
    - ~~知识库基础设施（KnowledgeService + VectorStore + EmbeddingProvider + ASTParser + CLI）~~ ✅ 已完成
-   - [ ] Tracer / Metrics（按需补充）
+   - ~~Tracer / Metrics~~ ✅ 已完成（traceId 全链路 + MetricsCollector 终态 run-summary）
    - [ ] Tool Layer（代码执行、Figma、Git；知识库检索不走 Tool，通过服务层注入）
    - [~] 存储层：✅ 产物/状态文件持久化（#82：FileSystemArtifactStore + state.json 快照 + --resume）；
    ⏳ PostgreSQL + pgvector 持久化（当前内存向量版，v2 目标）
@@ -442,7 +442,7 @@ v1 需要实现知识库基础设施，用于验证 Harness 和 DesignAgent 的�
    - [~] 评审 Agent：✅ 方案评审多轮已完成；⏳ 代码 CR 随 CodingAgent 落地
    - [~] 编码 Agent：✅ 单故事 TDD（red/green/fix）+ 逐故事循环与部分成功出口 + CR 内 revise（针对性修改+重跑测试）；✅ 真实子进程 runner（#83：LocalSubprocessTestRunner，CLI 默认，失败降级静态）
    - [~] 评审 Agent：✅ 方案评审多轮（review-design + Designer revise）+ 代码 CR 多轮（review-code + Coder revise）；⏳ 设计还原度图片比对 v2
-   - [ ] 交付 Agent（PR）
+   - ~~交付 Agent~~ ✅ 已完成（落盘 + 本地 git + 构建 + PR 描述；新项目技术栈反问；v1 不建远程 PR）
 5. ~~实现 Harness（状态机执行器 + 调度 + 上下文装配 + 异常 + 弱介入 + 回退 + 取消 + 知识库服务注入）~~ ✅ 已完成（ADR-014：ContextManager 只做产物装配，检索收归 Agent）
 6. [~] 评审阶段多轮对话机制（详见 [08-review-dialog.md](08-review-dialog.md)）——design 侧 ✅，code-review 侧随 CodingAgent
    - [x] 统一判定规则 review-policy（normalizeIssues/resolveDialogAction/findUnverifiedIssues/findUnansweredIssues）
@@ -455,12 +455,12 @@ v1 需要实现知识库基础设施，用于验证 Harness 和 DesignAgent 的�
 
 ## Harness 组件拆分状态
 
-设计中 Harness 拆分为 Scheduler / HumanInteraction / StateManager 独立类，当前 v1 内联在 Harness 类中。拆分时机：当 Harness 类超过 500 行或需要独立测试调度逻辑时。
+Harness 已在 issue #47 完成瘦身（1561 → 约 940 行），控制面只保留生命周期、主执行循环与硬卡点；可复用的子流程与纯逻辑已拆出独立模块（见文件头注释）：
 
-> 第七轮一致性审计已删除三个零引用空壳文件（scheduler.ts / human-interaction.ts / state-manager.ts），避免空壳误导；职责按下表内联/推迟，需要时再按本设计重建。
-
-| 组件 | 状态 | 说明 |
+| 组件 | 状态 | 位置 |
 |---|---|---|
-| Scheduler | 🟡 内联在 Harness | Agent 调度逻辑在 runExecutionLoop 中 |
-| HumanInteraction | 🟡 内联在 Harness | 硬卡点/弱介入（含超时竞速）/回退逻辑在 Harness 中 |
-| StateManager | ⚪ 推迟 | 状态持久化与崩溃恢复未实现（06-storage 设计），当前状态仅在内存 StateMachine |
+| 状态转换（state→阶段/Agent/下一状态） | ✅ 已拆出 | `src/core/state-transitions.ts`（FORWARD_NEXT_MAP 单一来源） |
+| 人工交互（硬卡点提问/回答、弱介入） | ✅ 已拆出 | `src/core/human-interaction.ts` |
+| 评审多轮对话 | ✅ 已拆出 | `src/core/review-dialog.ts`（ReviewDialogRunner） |
+| 编码逐故事 TDD | ✅ 已拆出 | `src/core/coding-phase.ts`（CodingPhaseRunner） |
+| 状态持久化与崩溃恢复 | ✅ 已实现 | `state-snapshot.ts`（state.json 原子快照 + `--resume`） |

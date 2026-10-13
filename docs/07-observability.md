@@ -93,6 +93,20 @@ AI 系统比传统系统更需要可观测性——输出不确定，出了问�
 LLM 输出格式漂移导致 JSON 解析失败时，日志记录 `rawLength` 与 `rawContentHead`（前 2000 字符），
 并提示按 traceId 查 `llm-calls.log` 获取完整原文——不再只记"解析失败"而无法看到模型实际返回了什么。
 
+### 超时、熔断与失败可观测（#62 / #18 / #19）
+
+真实运行曾出现故事拆解/方案阶段长时间挂死（实测约 15 分钟被网关静默断开），
+为此把"等多久、失败后怎么办"做成可观测、可配置：
+
+| 机制 | 配置 / 行为 | 可观测信号 |
+|---|---|---|
+| 请求超时 | `llm.timeoutMs`（默认 600000=10 分钟，略小于网关约 15 分钟断连点，让应用层先超时） | 超时进入重试，warn 日志带尝试次数 |
+| 熔断器 | `CircuitBreaker`：连续失败达 `retry.circuitBreakerFailureThreshold`（默认 5）→ OPEN 快速失败；冷却 `circuitBreakerResetTimeoutMs`（默认 30s）→ HALF_OPEN 放一次试探 | OPEN 时 warn "熔断打开，快速失败"，抛 `CircuitBreakerOpenError` |
+| 失败调用计入指标 | 失败的 LLM 调用也 `recordCall({success:false})`（#18，failedCalls 不再恒为 0） | run-summary 的失败数 / 失败率 |
+| JSON 截断恢复可感知 | `parseJsonWithRecovery` 修复时按类型告警：疑似 max_tokens 截断 → warn（核对后半完整性），逗号修复 → debug（#19） | pipeline.log 恢复告警；关键字段缺失仍由 validateOutput 拦截 |
+
+熔断状态机：CLOSED（正常、累计失败）→ OPEN（快速失败、不打模型）→ 冷却后 HALF_OPEN（一次试探）→ 成功回 CLOSED / 失败重新 OPEN。
+
 ## 第二层：链路追踪
 
 每个流程实例是一条完整 trace，每个阶段是一个 span：
@@ -148,7 +162,7 @@ trace: inst_abc123 (总耗时 5min)
 ### 存储与展示
 
 > ✅ **实现状态（MetricsCollector 已落地，#13）**：`src/observability/metrics.ts`——
-> Harness 创建单例并注入每个 AgentContext，BaseAgent 在每次 LLM 调用成功后按
+> Harness 创建单例并注入每个 AgentContext，BaseAgent 在每次 LLM 调用后（含失败，#18）按
 > **stage/agent 双维度**聚合：调用次数、失败数、prompt/completion/total tokens、累计耗时；
 > 流程终态（COMPLETED/FAILED/CANCELLED）原子落盘 `{instanceDir}/run-summary.json`，
 > 并在 CLI 终态输出摘要（总调用/总 token/总耗时 + 按阶段明细）。
@@ -200,6 +214,9 @@ trace: inst_abc123 (总耗时 5min)
   - 本次预估 + 累计 > 预算 → 不发起调用，暂停流程等人工（SUSPENDED，说明已消耗/预算/当前阶段）
 - 评审多轮对话是成本高发区（默认最多 3 轮 × 2 角色），预算检查同样作用于对话循环
 - HarnessConfig 暴露 `maxTokensPerRun` 便捷字段；v1 只做硬上限暂停，不做模型自动降级（v2）
+- 并发分批（故事拆解）下预算检查可能被同时突破：TokenBudgetTracker 提供
+  `reserve(estimate)/settle(reserved,actual)`，调用发起前同步原子预留
+  （used+reserved+estimate≤limit），结束后按实际结算，避免并发超支（#20）
 
 ## 实现方式
 

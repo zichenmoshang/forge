@@ -35,6 +35,7 @@ function buildConfigFromEnv(): Record<string, unknown> {
       model: env('LLM_MODEL'),
       defaultTemperature: env('LLM_TEMPERATURE'),
       defaultMaxTokens: env('LLM_MAX_TOKENS'),
+      timeoutMs: env('LLM_TIMEOUT_MS'),
     },
     postgres: {
       host: env('PG_HOST'),
@@ -55,6 +56,8 @@ function buildConfigFromEnv(): Record<string, unknown> {
       llmMaxRetries: env('LLM_MAX_RETRIES'),
       agentMaxRetries: env('AGENT_MAX_RETRIES'),
       baseDelayMs: env('RETRY_BASE_DELAY_MS'),
+      circuitBreakerFailureThreshold: env('CIRCUIT_BREAKER_FAILURE_THRESHOLD'),
+      circuitBreakerResetTimeoutMs: env('CIRCUIT_BREAKER_RESET_TIMEOUT_MS'),
     },
     coding: {
       maxTestRetriesPerStory: env('MAX_TEST_RETRIES_PER_STORY'),

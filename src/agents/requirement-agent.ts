@@ -20,6 +20,7 @@ import {
   STORY_SYSTEM_PROMPT,
   renderClarificationUserPrompt,
   renderStoryUserPrompt,
+  formatKnowledgeSection,
 } from '../prompts/requirement';
 
 /** 需求澄清输入 */
@@ -124,7 +125,11 @@ export class RequirementAgent extends BaseAgent<RequirementAgentInput, Requireme
             validateInput: (i: StoryGenerationInput) => this.validateStoryInput(i),
             retrieveKnowledge: (i: StoryGenerationInput, ctx: AgentContext) => this.retrieveKnowledge(i, ctx),
             buildSystemPrompt: () => this.buildStorySystemPrompt(),
-            buildUserPrompt: (i: StoryGenerationInput) => Promise.resolve(this.buildStoryUserPrompt(i)),
+            buildUserPrompt: (
+              i: StoryGenerationInput,
+              _ctx: AgentContext,
+              knowledge: KnowledgeItem[],
+            ) => Promise.resolve(this.buildStoryUserPrompt(i, knowledge)),
             parseOutput: (content: string, i: StoryGenerationInput) => this.parseStoryOutput(content, i),
             validateOutput: (output: UserStorySet) => this.validateStoryOutput(output),
             selfCheck: (output: UserStorySet) => this.selfCheckStory(output),
@@ -245,15 +250,66 @@ export class RequirementAgent extends BaseAgent<RequirementAgentInput, Requireme
   protected async buildUserPrompt(
     input: RequirementAgentInput,
     _context: AgentContext,
-    _knowledge: KnowledgeItem[],
+    knowledge: KnowledgeItem[],
   ): Promise<string> {
     if (input.type === 'clarify') {
-      return this.buildClarificationUserPrompt(input);
+      return this.buildClarificationUserPrompt(input, knowledge);
     }
     if (input.type === 'clarify-followup') {
-      return this.buildFollowupUserPrompt(input);
+      return this.buildFollowupUserPrompt(input, knowledge);
     }
-    return this.buildStoryUserPrompt(input);
+    return this.buildStoryUserPrompt(input, knowledge);
+  }
+
+  /**
+   * 需求阶段知识库检索（P0-B）：澄清 / followup / 故事拆解分别构造多路 query，
+   * 团队飞书 wiki（规范、历史澄清/故事）通过 searchKnowledge 多路并行检索。
+   */
+  protected async retrieveKnowledge(
+    input: RequirementAgentInput,
+    context: AgentContext,
+  ): Promise<KnowledgeItem[]> {
+    if (input.type === 'clarify') {
+      // 首次澄清尚无结构化信息，用 PRD 文本片段 + 通用规范多路检索
+      const head = input.prdText.slice(0, 500);
+      return this.searchKnowledge(context, [
+        { query: `${head} 需求 功能 业务`, topK: 5 },
+        {
+          query: '需求澄清 非功能需求 全局需求 登录权限 错误监控 团队规范',
+          types: ['spec', 'doc', 'exception', 'pattern'],
+          topK: 5,
+        },
+      ]);
+    }
+
+    if (input.type === 'clarify-followup') {
+      const req = input.previousRequirement;
+      const pending = req.clarificationLog
+        .filter((q) => q.status === 'pending')
+        .map((q) => q.question)
+        .join(' ');
+      return this.searchKnowledge(context, [
+        { query: `${req.meta.title} ${pending}`, topK: 5 },
+        {
+          query: '需求澄清 非功能需求 全局需求 团队规范',
+          types: ['spec', 'doc', 'exception'],
+          topK: 3,
+        },
+      ]);
+    }
+
+    // generate-stories：用功能点/模块检索既有组件、模式、历史故事
+    const featureKeywords = input.requirement.features
+      .map((f) => `${f.name} ${f.module}`)
+      .join(' ');
+    return this.searchKnowledge(context, [
+      { query: `${featureKeywords} 用户故事 组件 拆解`, topK: 6 },
+      {
+        query: `${input.requirement.meta.title} 状态管理 异常处理 页面`,
+        types: ['component', 'pattern', 'story', 'exception'],
+        topK: 6,
+      },
+    ]);
   }
 
   protected parseOutput(content: string, input: RequirementAgentInput): RequirementAgentOutput {
@@ -330,14 +386,21 @@ export class RequirementAgent extends BaseAgent<RequirementAgentInput, Requireme
     return CLARIFICATION_SYSTEM_PROMPT;
   }
 
-  private buildClarificationUserPrompt(input: ClarificationInput): string {
+  private buildClarificationUserPrompt(
+    input: ClarificationInput,
+    knowledge?: KnowledgeItem[],
+  ): string {
     return renderClarificationUserPrompt({
       source: input.source ?? '未知来源',
       prdText: input.prdText,
+      knowledge,
     });
   }
 
-  private buildFollowupUserPrompt(input: ClarificationFollowupInput): string {
+  private buildFollowupUserPrompt(
+    input: ClarificationFollowupInput,
+    knowledge?: KnowledgeItem[],
+  ): string {
     const req = input.previousRequirement;
 
     // 从 humanAnswers 读取统一回答（#13 修复后，回答存在这里）
@@ -370,7 +433,7 @@ ${resolvedQuestions || '（无）'}
 仍待澄清的问题：
 ${pendingQuestions || '（无）'}
 
-【输出要求 — 增量模式，不要输出完整需求】
+${formatKnowledgeSection(knowledge)}【输出要求 — 增量模式，不要输出完整需求】
 只输出以下两部分：
 1. clarificationLog（必填）：更新后的澄清问题列表。已解决的问题标记 status: "resolved"，新问题标记 status: "pending"。如果没有任何待澄清的新问题，输出空数组 []。
 2. updates（可选）：只有当人工回答导致需求内容实际变更时才输出。包含需要更新的字段（如 features、businessRules、nonFunctionalRequirements 等），每个字段输出完整的更新后数组。如果没有内容变更，不要输出 updates。
@@ -622,8 +685,8 @@ ${pendingQuestions || '（无）'}
     return STORY_SYSTEM_PROMPT;
   }
 
-  private buildStoryUserPrompt(input: StoryGenerationInput): string {
-    return renderStoryUserPrompt({ requirement: input.requirement });
+  private buildStoryUserPrompt(input: StoryGenerationInput, knowledge?: KnowledgeItem[]): string {
+    return renderStoryUserPrompt({ requirement: input.requirement, knowledge });
   }
 
   private parseStoryOutput(content: string, input: StoryGenerationInput): UserStorySet {

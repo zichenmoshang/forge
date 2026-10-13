@@ -36,6 +36,12 @@ import {
   type WriteFileResult,
   type ProjectState,
 } from '../tools/delivery';
+import {
+  buildTechStackQuestion,
+  parseTechStackAnswer,
+  DEFAULT_TECH_STACK_RECOMMENDATION,
+  type TechStackRecommendation,
+} from '../core/tech-stack-prompt';
 
 /** DeliveryAgent 构造函数选项 */
 export interface DeliveryAgentOptions {
@@ -160,7 +166,7 @@ export class DeliveryAgent extends BaseAgent<DeliveryAgentInput, DeliveryResult>
   /** 执行交付的程序化操作：场景判定 + 初始化 + 落盘 + 构建 + Git */
   private async performDelivery(
     input: DeliveryAgentInput,
-    _context: AgentContext,
+    context: AgentContext,
   ): Promise<DeliveryExecutionState> {
     const targetPath = this.deliveryConfig.targetProjectPath;
     const state: DeliveryExecutionState = {
@@ -185,17 +191,31 @@ export class DeliveryAgent extends BaseAgent<DeliveryAgentInput, DeliveryResult>
       `[DeliveryAgent] 交付场景: ${state.scenario}（项目存在: ${state.projectState.exists}, hasPackageJson: ${state.projectState.hasPackageJson}）`,
     );
 
-    // 2.2 新项目初始化
+    // 2.2 新项目初始化：知识库经验给推荐 → 反问人工技术栈 → 解析为初始化选项
     if (state.scenario === 'new-project' && !state.projectState.hasPackageJson) {
       try {
-        await this.fileSystemClient.initNewProject(targetPath, {
-          framework: 'react',
-          packageManager: 'npm',
-          buildTool: 'vite',
-          projectName: this.extractProjectName(targetPath),
-          typescript: true,
-        });
-        this.logger?.info('[DeliveryAgent] 新项目初始化完成（React + TypeScript + Vite）');
+        const projectName = this.extractProjectName(targetPath);
+        const recommendation = await this.buildTechStackRecommendation(context);
+        // 有文本输入通道则反问人工；否则（未注入/非交互）完全采用推荐
+        const initOptions = context.requestHumanInput
+          ? parseTechStackAnswer(
+              recommendation,
+              await context.requestHumanInput(
+                buildTechStackQuestion(recommendation, projectName),
+              ),
+            )
+          : parseTechStackAnswer(recommendation, undefined);
+        initOptions.projectName = projectName;
+        if (initOptions.ignored.length > 0) {
+          state.knownIssues.push(
+            `技术栈回答以下项未识别，已采用推荐: ${initOptions.ignored.join(', ')}`,
+          );
+        }
+        await this.fileSystemClient.initNewProject(targetPath, initOptions);
+        this.logger?.info(
+          `[DeliveryAgent] 新项目初始化完成（${initOptions.framework} + ` +
+            `${initOptions.typescript ? 'TypeScript' : 'JavaScript'} + ${initOptions.buildTool}）`,
+        );
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         state.knownIssues.push(`新项目初始化失败: ${errorMsg}`);
@@ -480,6 +500,32 @@ ${state.knownIssues.length > 0 ? state.knownIssues.map((i) => `- ${i}`).join('\n
   private extractProjectName(targetPath: string): string {
     const parts = targetPath.replace(/\\/g, '/').split('/').filter(Boolean);
     return parts[parts.length - 1] ?? 'forge-project';
+  }
+
+  /**
+   * 结合知识库经验构造技术栈推荐。
+   * 检索团队脚手架/技术栈约定；无命中或检索异常时回退团队默认基线。
+   * v1 仅用检索结果作为"推荐依据"展示，默认项保持团队基线（不自动从文本推断版本）。
+   */
+  private async buildTechStackRecommendation(
+    context: AgentContext,
+  ): Promise<TechStackRecommendation> {
+    try {
+      const items = await this.searchKnowledge(context, [
+        {
+          query: '前端项目初始化 技术栈 脚手架 框架 构建工具 包管理器 团队约定',
+          topK: 5,
+        },
+      ]);
+      if (items.length === 0) return DEFAULT_TECH_STACK_RECOMMENDATION;
+      const reasons = items
+        .slice(0, 3)
+        .map((i) => (i.summary || i.title || '').trim())
+        .filter(Boolean);
+      return { ...DEFAULT_TECH_STACK_RECOMMENDATION, reasons };
+    } catch {
+      return DEFAULT_TECH_STACK_RECOMMENDATION;
+    }
   }
 
   // ==========================================================================

@@ -8,6 +8,7 @@
 import type { LLMConfig } from '../config';
 import type { LLMProvider } from './provider';
 import { OpenAIProvider } from './implementations/openai-provider';
+import { CircuitBreaker } from './circuit-breaker';
 import type { Logger } from '../observability/logger';
 
 export type { LLMConfig } from '../config';
@@ -16,6 +17,8 @@ export interface CreateProviderOptions {
   logger?: Logger;
   maxRetries?: number;
   baseDelayMs?: number;
+  /** 熔断器（可选，由调用方构造并在整个 run 内共享同一实例） */
+  breaker?: CircuitBreaker;
 }
 
 /**

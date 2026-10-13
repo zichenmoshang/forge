@@ -29,6 +29,7 @@ import {
   saveStateSnapshot,
   isTerminalSnapshot,
 } from './state-snapshot';
+import * as fs from 'fs';
 import * as path from 'path';
 import { ContextManager } from './context-manager';
 import { ReviewDialogRunner } from './review-dialog';
@@ -110,6 +111,8 @@ export interface HarnessConfig {
   knowledgeService?: KnowledgeService;
   /** 硬卡点人工介入回调 */
   onHumanIntervention?: HumanInterventionCallback;
+  /** 自由文本人工输入回调（新项目技术栈反问等；非交互模式应返回 undefined 以走推荐默认） */
+  onRequestHumanInput?: (question: string) => Promise<string | undefined>;
   /** 弱介入窗口回调（故事拆解/方案评审/代码CR后触发） */
   onWeakIntervention?: WeakInterventionCallback;
   logger?: Logger;
@@ -158,6 +161,7 @@ export class Harness {
   private artifactStore: ArtifactStore;
   private contextManager: ContextManager;
   private onHumanIntervention?: HumanInterventionCallback;
+  private onRequestHumanInput?: (question: string) => Promise<string | undefined>;
   private onWeakIntervention?: WeakInterventionCallback;
   private logger?: Logger;
   private maxRetries: number;
@@ -236,6 +240,7 @@ export class Harness {
       globalContext: this.globalContext,
     });
     this.onHumanIntervention = config.onHumanIntervention;
+    this.onRequestHumanInput = config.onRequestHumanInput;
     this.onWeakIntervention = config.onWeakIntervention;
 
     // 如果没有传入 Logger，自动创建按实例分目录的 Logger
@@ -244,7 +249,7 @@ export class Harness {
     } else {
       const obsConfig: ObservabilityConfig = {
         logLevel: 'info',
-        logDir: `./data/instances/${this.instanceId}/logs`,
+        logDir: path.join(this.instanceDir, 'logs'),
         logLLMRequests: true,
       };
       this.logger = new LoggerImpl(obsConfig);
@@ -531,6 +536,7 @@ export class Harness {
       projectId: this.projectId,
       tokenBudget: this.tokenBudget,
       metrics: this.metrics,
+      requestHumanInput: this.onRequestHumanInput,
     };
 
     try {
@@ -723,6 +729,7 @@ export class Harness {
         projectId: this.projectId,
         tokenBudget: this.tokenBudget,
         metrics: this.metrics,
+        requestHumanInput: this.onRequestHumanInput,
       };
 
       let result: AgentResult;
@@ -863,19 +870,6 @@ export class Harness {
     }
   }
 
-  /** 评审相关配置（issue #42 评审对话循环消费） */
-  getReviewConfig(): { maxReviewRounds: number; interruptAfterEachRound: boolean } {
-    return {
-      maxReviewRounds: this.maxReviewRounds,
-      interruptAfterEachRound: this.interruptAfterEachRound,
-    };
-  }
-
-  /** 单流程 token 预算（0 不限，issue #39 消费） */
-  getTokenBudget(): number {
-    return this.maxTokensPerRun;
-  }
-
   private failExecution(message: string): HarnessExecutionResult {
     this.logger?.error(`[Harness] 执行失败: ${message}`);
     this.stateMachine.transition({ type: 'FAIL', reason: message });
@@ -894,7 +888,6 @@ export class Harness {
 
   /** 读取实例目录下 trace-id.txt；不存在则生成 UUID 并持久化（快照恢复后链路 ID 保持一致） */
   private resolveOrCreateTraceId(instanceDir: string): string {
-    const fs = require('fs');
     try {
       if (!fs.existsSync(instanceDir)) fs.mkdirSync(instanceDir, { recursive: true });
       const traceFile = path.join(instanceDir, 'trace-id.txt');

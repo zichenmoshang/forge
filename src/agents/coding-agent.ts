@@ -149,12 +149,23 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
   private readonly workspace: Workspace;
   private readonly testRunner: TestRunner;
   private readonly maxGreenAttempts: number;
+  /**
+   * 跨故事累积的已生成文件（真实 TDD 跨故事依赖）。
+   * 每个故事开始时写回工作区，使后续故事 import 已生成组件可解析；
+   * CodingPhaseRunner 在编码阶段开始时调 resetStoryAccumulation() 清空。
+   */
+  private accumulatedFiles: GeneratedFile[] = [];
 
   constructor(llm: LLMProvider, options?: CodingAgentOptions) {
     super(llm, options);
     this.workspace = options?.workspace ?? new InMemoryWorkspace();
     this.testRunner = options?.testRunner ?? new StaticTestRunner();
     this.maxGreenAttempts = options?.maxGreenAttempts ?? 5;
+  }
+
+  /** 编码阶段开始时清空跨故事累积（由 CodingPhaseRunner 调用一次） */
+  resetStoryAccumulation(): void {
+    this.accumulatedFiles = [];
   }
 
   // ============================================================
@@ -299,8 +310,9 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
     let llmCalls = 0;
     const tddCycles: TddCycle[] = [];
 
-    // 每故事独立沙箱
+    // 每故事独立沙箱：清空后写回此前故事已生成文件（跨故事依赖，保证 import 可解析）
     this.workspace.clear();
+    this.writeToWorkspace(this.accumulatedFiles);
 
     // ---------- RED ----------
     const redResult = await this.execute({ ...context, input: task });
@@ -497,6 +509,11 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
       completedAt: new Date().toISOString(),
     };
 
+    // 跨故事累积：complete/partial 故事的文件并入，供后续故事 import（failed 不累积）
+    if (status !== 'failed') {
+      this.accumulatedFiles = mergeGeneratedFiles(this.accumulatedFiles, result.files);
+    }
+
     return {
       // partial 仍交付可用产物，算成功；failed 才算 Agent 失败
       success: status !== 'failed',
@@ -555,7 +572,9 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
     // 后处理：把合并后的文件写入工作区，重跑测试，更新状态
     const revision = result.data;
     const updated = revision.updatedResult;
+    // 清空后先写回跨故事累积（含本故事旧版），再写本次修订（同路径覆盖），保留其他故事文件
     this.workspace.clear();
+    this.writeToWorkspace(this.accumulatedFiles);
     this.writeToWorkspace(updated.files);
     // expectedAcIds 为任务中所有可测试 AC（与 generateCode 一致），StaticTestRunner 据此检查覆盖
     const expectedAcIds = input.task.acceptanceCriteria
@@ -585,6 +604,8 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
       attemptsExhausted: false,
     });
     updated.completedAt = new Date().toISOString();
+    // 同步跨故事累积：本故事修订后的全量文件覆盖旧版，供后续故事/后续修订使用
+    this.accumulatedFiles = mergeGeneratedFiles(this.accumulatedFiles, updated.files);
     return result;
   }
 

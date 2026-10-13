@@ -46,6 +46,11 @@ export interface AgentContext {
   tokenBudget?: TokenBudgetTracker;
   /** Metrics 指标聚合器（由 Harness 注入，BaseAgent 每次 LLM 调用后记录，终态产出 run-summary） */
   metrics?: MetricsCollector;
+  /**
+   * 请求人工文本输入（用于新项目技术栈反问等"非硬卡点"的自由文本采集）。
+   * 由 Harness 注入；非交互/自动确认模式返回 undefined，调用方据此走推荐默认。
+   */
+  requestHumanInput?: (question: string) => Promise<string | undefined>;
   /** 额外参数 */
   params?: Record<string, unknown>;
 }

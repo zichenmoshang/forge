@@ -10,6 +10,7 @@ import OpenAI from 'openai';
 import type { LLMProvider, LLMRequest, LLMResponse } from '../provider';
 import type { LLMConfig } from '../../config';
 import type { Logger } from '../../observability/logger';
+import { CircuitBreaker, CircuitBreakerOpenError } from '../circuit-breaker';
 
 export class OpenAIProvider implements LLMProvider {
   readonly name = 'openai';
@@ -19,25 +20,41 @@ export class OpenAIProvider implements LLMProvider {
   private logger?: Logger;
   private maxRetries: number;
   private baseDelayMs: number;
+  private breaker?: CircuitBreaker;
 
   constructor(
     config: LLMConfig,
-    options?: { logger?: Logger; maxRetries?: number; baseDelayMs?: number },
+    options?: {
+      logger?: Logger;
+      maxRetries?: number;
+      baseDelayMs?: number;
+      breaker?: CircuitBreaker;
+    },
   ) {
     this.config = config;
     this.logger = options?.logger;
     this.maxRetries = options?.maxRetries ?? 3;
     this.baseDelayMs = options?.baseDelayMs ?? 1000;
+    this.breaker = options?.breaker;
 
     this.client = new OpenAI({
       apiKey: config.apiKey,
       baseURL: config.baseUrl || undefined,
-      // 大输出量场景（故事拆解、技术方案）可能需要较长生成时间，设置 30 分钟超时
-      timeout: 30 * 60 * 1000,
+      // 超时可配置（issue #62）：默认 10 分钟，略小于网关实测约 15 分钟断连点，让应用层先超时重试
+      timeout: config.timeoutMs,
     });
   }
 
   async complete(request: LLMRequest): Promise<LLMResponse> {
+    // 熔断打开：快速失败，不打模型、不重试
+    if (this.breaker && !this.breaker.canExecute()) {
+      this.logger?.warn('LLM 熔断打开，快速失败', {
+        instanceId: request.instanceId,
+        agent: request.caller,
+      });
+      throw new CircuitBreakerOpenError();
+    }
+
     const startTime = Date.now();
     let lastError: Error | null = null;
 
@@ -82,6 +99,7 @@ export class OpenAIProvider implements LLMProvider {
           finishReason: result.finishReason,
         });
 
+        this.breaker?.recordSuccess();
         return result;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -94,6 +112,10 @@ export class OpenAIProvider implements LLMProvider {
             agent: request.caller,
           },
         );
+
+        // 记录熔断失败；若熔断已打开（含半开试探失败），停止重试、快速结束
+        this.breaker?.recordFailure();
+        if (this.breaker && this.breaker.getState() === 'open') break;
 
         // 如果是最后一次尝试，不再重试
         if (attempt >= this.maxRetries) break;

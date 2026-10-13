@@ -33,6 +33,11 @@ export const llmConfigSchema = z.object({
   model: z.string().min(1).default('gpt-4o'),
   defaultTemperature: z.coerce.number().min(0).max(2).default(0.7),
   defaultMaxTokens: z.coerce.number().int().positive().default(4096),
+  /**
+   * 单次请求超时（毫秒）。默认 600000（10 分钟）：
+   * 略小于网关/代理实测约 15 分钟的静默断连点，让应用层先超时并进入重试（issue #62）。
+   */
+  timeoutMs: z.coerce.number().int().positive().default(600000),
 });
 
 // PostgreSQL 配置
@@ -60,6 +65,10 @@ export const retryConfigSchema = z.object({
   llmMaxRetries: z.coerce.number().int().min(0).default(3),
   agentMaxRetries: z.coerce.number().int().min(0).default(2),
   baseDelayMs: z.coerce.number().int().positive().default(1000),
+  /** LLM 熔断：连续失败多少次后打开（快速失败、不再打模型），默认 5 */
+  circuitBreakerFailureThreshold: z.coerce.number().int().positive().default(5),
+  /** LLM 熔断：打开后多久进入半开试探（毫秒），默认 30000 */
+  circuitBreakerResetTimeoutMs: z.coerce.number().int().positive().default(30000),
 });
 
 // 编码阶段配置

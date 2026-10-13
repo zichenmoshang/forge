@@ -169,7 +169,55 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
           traceId: context.traceId,
         };
 
-        const response = await this.llm.complete(llmRequest);
+        // 并发预算原子化：调用前按本次最大可能输出预留，避免多批次并发同时突破总预算
+        const reservation = budget
+          ? budget.reserve(llmRequest.maxTokens ?? 0)
+          : { ok: true as const, reserved: 0 };
+        if (budget && !reservation.ok) {
+          this.logger?.error(
+            `[${this.name}] Token 预算不足以预留本次输出: ${reservation.reason}`,
+            {
+              instanceId: context.instanceId,
+              traceId: context.traceId,
+              stage: context.stage,
+              agent: this.name,
+            },
+          );
+          return this.buildFailure<TO>(
+            [
+              {
+                code: 'BUDGET_EXCEEDED',
+                message: `单流程 token 预算不足：${
+                  reservation.reason ?? '剩余额度无法容纳本次输出'
+                }，需人工调整预算或降级后重试`,
+                severity: 'error',
+              },
+            ],
+            startTime,
+            llmCalls,
+            retries,
+          );
+        }
+
+        const callStart = Date.now();
+        let response: Awaited<ReturnType<LLMProvider['complete']>>;
+        try {
+          response = await this.llm.complete(llmRequest);
+        } catch (callErr) {
+          // 失败调用也计入 Metrics（否则 run-summary.failedCalls 恒为 0），并回滚本次预留
+          budget?.release(reservation.reserved);
+          context.metrics?.recordCall({
+            stage: context.stage,
+            agent: this.name,
+            model: 'unknown',
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+            durationMs: Date.now() - callStart,
+            success: false,
+          });
+          throw callErr;
+        }
         llmCalls++;
 
         // Metrics：记录本次调用指标（终态聚合 run-summary，#87 性能基准数据源）
@@ -198,6 +246,7 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
                 agent: this.name,
               },
             );
+            budget.release(reservation.reserved);
             return this.buildFailure<TO>(
               [
                 {
@@ -211,7 +260,7 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
               retries,
             );
           }
-          const acc = budget.add(response.totalTokens);
+          const acc = budget.settle(reservation.reserved, response.totalTokens);
           if (acc.exceeded) {
             this.logger?.warn(
               `[${this.name}] 本次调用后累计 token ${acc.used}/${acc.limit}，已触及预算上限`,
@@ -449,7 +498,9 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
       const recovered = this.recoverTruncatedJson(jsonStr);
       if (recovered !== jsonStr) {
         try {
-          return JSON.parse(recovered) as T;
+          const parsed = JSON.parse(recovered) as T;
+          this.notifyJsonRecovered('truncation');
+          return parsed;
         } catch {
           // 继续尝试其他恢复策略
         }
@@ -459,7 +510,9 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
       const trimmed = this.removeTrailingCommas(jsonStr);
       if (trimmed !== jsonStr) {
         try {
-          return JSON.parse(trimmed) as T;
+          const parsed = JSON.parse(trimmed) as T;
+          this.notifyJsonRecovered('comma');
+          return parsed;
         } catch {
           // 继续
         }
@@ -469,13 +522,31 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
       if (recovered !== jsonStr) {
         const recoveredTrimmed = this.removeTrailingCommas(recovered);
         try {
-          return JSON.parse(recoveredTrimmed) as T;
+          const parsed = JSON.parse(recoveredTrimmed) as T;
+          this.notifyJsonRecovered('truncation');
+          return parsed;
         } catch {
           // 全部失败，抛出原始错误
         }
       }
 
       throw firstError;
+    }
+  }
+
+  /**
+   * JSON 恢复成功后的可感知提示（issue：恢复曾静默，残缺产物可能以 success 落盘）。
+   * - truncation：输出疑似被 max_tokens 截断，warn 级，提示核对产物后半完整性；
+   *   关键字段缺失仍由各 Agent 的 validateOutput 拦截为 error。
+   * - comma：仅修复尾部多余逗号，debug 级。
+   */
+  private notifyJsonRecovered(kind: 'truncation' | 'comma'): void {
+    if (kind === 'truncation') {
+      this.logger?.warn(
+        `[${this.name}] LLM 输出疑似被 max_tokens 截断，已裁剪/补全尾部恢复为可解析 JSON；请核对产物后半部分是否完整（缺失的关键字段应由 validateOutput 拦截）`,
+      );
+    } else {
+      this.logger?.debug(`[${this.name}] JSON 尾部多余逗号已自动修复`);
     }
   }
 

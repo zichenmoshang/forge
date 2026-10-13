@@ -54,27 +54,33 @@ export function getArtifactStage(state: PipelineStateName): ArtifactStage | unde
   }
 }
 
+/**
+ * 前进方向转换的单一事实来源（from → 前进的 to）。
+ * 终态/自循环态（COMPLETED/FAILED/CANCELLED/SUSPENDED）指向自身，表示"无前进"。
+ * StateMachine 的 ADVANCE_TRANSITIONS 由本表派生，避免两份转换表漂移。
+ */
+export const FORWARD_NEXT_MAP: Record<PipelineStateName, PipelineStateName> = {
+  INIT: 'REQUIREMENT_PARSING',
+  REQUIREMENT_PARSING: 'REQUIREMENT_CLARIFICATION',
+  REQUIREMENT_CLARIFICATION: 'STORIES_GENERATING',
+  STORIES_GENERATING: 'DESIGN_GENERATING',
+  // ADR-014：方案生成 → 方案评审 → API 确认 → 编码
+  DESIGN_GENERATING: 'DESIGN_REVIEWING',
+  DESIGN_REVIEWING: 'API_CONFIRMATION',
+  API_CONFIRMATION: 'CODING',
+  CODING: 'CODE_REVIEWING',
+  CODE_REVIEWING: 'DELIVERING',
+  DELIVERING: 'DELIVERY_CONFIRMATION',
+  DELIVERY_CONFIRMATION: 'COMPLETED',
+  COMPLETED: 'COMPLETED',
+  FAILED: 'FAILED',
+  CANCELLED: 'CANCELLED',
+  SUSPENDED: 'SUSPENDED',
+};
+
 /** 状态 → 下一状态（ADR-014 顺序：设计 → 评审 → API 确认 → 编码） */
 export function getNextState(state: PipelineStateName): PipelineStateName | undefined {
-  const transitions: Record<PipelineStateName, PipelineStateName> = {
-    INIT: 'REQUIREMENT_PARSING',
-    REQUIREMENT_PARSING: 'REQUIREMENT_CLARIFICATION',
-    REQUIREMENT_CLARIFICATION: 'STORIES_GENERATING',
-    STORIES_GENERATING: 'DESIGN_GENERATING',
-    // ADR-014：方案生成 → 方案评审 → API 确认 → 编码
-    DESIGN_GENERATING: 'DESIGN_REVIEWING',
-    DESIGN_REVIEWING: 'API_CONFIRMATION',
-    API_CONFIRMATION: 'CODING',
-    CODING: 'CODE_REVIEWING',
-    CODE_REVIEWING: 'DELIVERING',
-    DELIVERING: 'DELIVERY_CONFIRMATION',
-    DELIVERY_CONFIRMATION: 'COMPLETED',
-    COMPLETED: 'COMPLETED',
-    FAILED: 'FAILED',
-    CANCELLED: 'CANCELLED',
-    SUSPENDED: 'SUSPENDED',
-  };
-  return transitions[state];
+  return FORWARD_NEXT_MAP[state];
 }
 
 /** 硬卡点确认后的下一状态（当前语义与 getNextState 一致，保留独立函数便于后续特化） */

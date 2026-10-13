@@ -14,26 +14,21 @@ import type {
   StateAction,
   StateTransitionResult,
 } from '../types/state';
+import { FORWARD_NEXT_MAP } from './state-transitions';
 
-/** 合法的前进转换（from -> 允许的 to 列表） */
-const ADVANCE_TRANSITIONS: Record<PipelineStateName, PipelineStateName[]> = {
-  INIT: ['REQUIREMENT_PARSING'],
-  REQUIREMENT_PARSING: ['REQUIREMENT_CLARIFICATION'],
-  REQUIREMENT_CLARIFICATION: ['STORIES_GENERATING'],
-  STORIES_GENERATING: ['DESIGN_GENERATING'],
-  // ADR-014：先评审、后确认 API，人工确认的是评审后的稳定契约
-  DESIGN_GENERATING: ['DESIGN_REVIEWING'],
-  DESIGN_REVIEWING: ['API_CONFIRMATION'],
-  API_CONFIRMATION: ['CODING'],
-  CODING: ['CODE_REVIEWING'],
-  CODE_REVIEWING: ['DELIVERING'],
-  DELIVERING: ['DELIVERY_CONFIRMATION'],
-  DELIVERY_CONFIRMATION: ['COMPLETED'],
-  COMPLETED: [],
-  FAILED: [],
-  CANCELLED: [],
-  SUSPENDED: [],
-};
+/**
+ * 合法的前进转换（from -> 允许的 to 列表）。
+ * 派生自 state-transitions 的 FORWARD_NEXT_MAP（单一事实来源）：
+ * 指向自身的状态（终态/挂起）无前进目标 → 空列表，避免两份转换表漂移。
+ */
+const ADVANCE_TRANSITIONS: Record<PipelineStateName, PipelineStateName[]> = (() => {
+  const table = {} as Record<PipelineStateName, PipelineStateName[]>;
+  for (const state of Object.keys(FORWARD_NEXT_MAP) as PipelineStateName[]) {
+    const next = FORWARD_NEXT_MAP[state];
+    table[state] = next !== state ? [next] : [];
+  }
+  return table;
+})();
 
 /** 合法的回退转换（from -> 允许的 to 列表） */
 const FALLBACK_TRANSITIONS: Record<PipelineStateName, PipelineStateName[]> = {

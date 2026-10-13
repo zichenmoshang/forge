@@ -79,6 +79,8 @@ export class CodingPhaseRunner {
     const { agents, artifactStore, stateMachine, contextManager, instanceId, logger } = this.deps;
     const codingAgent = agents.coding;
     if (!codingAgent) return this.callbacks.failExecution('状态 CODING 缺少 CodingAgent');
+    // 编码阶段开始：清空跨故事累积，避免新一轮编码继承上一次运行残留
+    codingAgent.resetStoryAccumulation();
 
     const stories = artifactStore.get<UserStorySet>('stories', instanceId);
     const design = artifactStore.get<FrontendDesignDoc>('design', instanceId);
