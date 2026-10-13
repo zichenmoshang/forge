@@ -20,6 +20,7 @@ import {
   isHardBlockingState,
   isTerminalState,
 } from './state-machine';
+import { randomUUID } from 'crypto';
 import { InMemoryArtifactStore } from './artifact-store';
 import type { ArtifactStore } from './artifact-store';
 import {
@@ -56,6 +57,8 @@ import { buildFreezeChecklist } from './freeze-checklist';
 import { TokenBudgetTracker } from './token-budget';
 import type { Logger } from '../observability/logger';
 import { Logger as LoggerImpl } from '../observability/logger';
+import { MetricsCollector } from '../observability/metrics';
+import type { RunSummary } from '../observability/metrics';
 import type { ObservabilityConfig } from '../config';
 import type { KnowledgeService } from '../services/knowledge-service';
 
@@ -179,6 +182,10 @@ export class Harness {
   readonly instanceId: string;
   /** 实例目录（产物/快照/日志落盘根） */
   private readonly instanceDir: string;
+  /** 链路追踪根 ID（全流程不变，快照恢复时保持一致，独立持久化 trace-id.txt） */
+  readonly traceId: string;
+  /** Metrics 指标聚合器（终态产出 run-summary.json） */
+  private readonly metrics: MetricsCollector;
   /** 评审多轮对话 Runner（issue #47 拆分） */
   private readonly reviewDialog: ReviewDialogRunner;
   /** 编码阶段 Runner（issue #47 拆分） */
@@ -189,6 +196,13 @@ export class Harness {
     this.agents = config.agents;
     // 实例目录：产物、状态快照、日志的落盘根目录（issue #82）
     this.instanceDir = config.instanceDir ?? path.join('data', 'instances', this.instanceId);
+
+    // traceId：全流程链路根 ID。独立持久化 trace-id.txt，保证快照恢复后链路 ID 一致
+    this.traceId = this.resolveOrCreateTraceId(this.instanceDir);
+
+    // Metrics：进程内按 stage/agent 聚合调用指标，终态落盘 run-summary.json
+    this.metrics = new MetricsCollector(this.instanceId, this.traceId);
+
     // 默认文件系统产物存储：产物落盘，进程重启后可恢复；测试场景仍可显式传入 InMemoryArtifactStore
     this.artifactStore =
       config.artifactStore ??
@@ -277,6 +291,8 @@ export class Harness {
         knowledgeService: this.knowledgeService,
         projectId: this.projectId,
         tokenBudget: this.tokenBudget,
+        traceId: this.traceId,
+        metrics: this.metrics,
       },
       {
         failExecution: (m) => this.failExecution(m),
@@ -316,6 +332,8 @@ export class Harness {
         tokenBudget: this.tokenBudget,
         projectContext: this.projectContext,
         testRequirements: this.testRequirements,
+        traceId: this.traceId,
+        metrics: this.metrics,
       },
       {
         failExecution: (m) => this.failExecution(m),
@@ -501,6 +519,7 @@ export class Harness {
     // 调用 RequirementAgent 的 followup 模式
     const context: AgentContext = {
       instanceId: this.instanceId,
+      traceId: this.traceId,
       stage: 'requirement-clarification',
       input: {
         type: 'clarify-followup',
@@ -511,6 +530,7 @@ export class Harness {
       knowledgeService: this.knowledgeService,
       projectId: this.projectId,
       tokenBudget: this.tokenBudget,
+      metrics: this.metrics,
     };
 
     try {
@@ -639,6 +659,7 @@ export class Harness {
 
     this.logger?.warn(`[Harness] 流程取消: ${reason}`);
     const result = this.stateMachine.transition({ type: 'CANCEL', reason });
+    this.finalizeSummary('CANCELLED');
     return {
       success: result.success,
       finalState: 'CANCELLED',
@@ -693,6 +714,7 @@ export class Harness {
       // 调用 Agent
       const context: AgentContext = {
         instanceId: this.instanceId,
+        traceId: this.traceId,
         stage: stateToStage(state.currentState),
         input: agentInput,
         globalContext: this.contextManager.getGlobalContext(),
@@ -700,6 +722,7 @@ export class Harness {
         knowledgeService: this.knowledgeService,
         projectId: this.projectId,
         tokenBudget: this.tokenBudget,
+        metrics: this.metrics,
       };
 
       let result: AgentResult;
@@ -819,10 +842,12 @@ export class Harness {
       }
     }
 
-    // 终态
+    // 终态：聚合指标落盘 run-summary.json 并打印摘要
+    const summary = this.finalizeSummary(state.currentState);
     return {
       success: state.currentState === 'COMPLETED',
       finalState: state.currentState,
+      message: summary ? this.formatSummaryMessage(summary) : undefined,
       waitingForHuman: false,
     };
   }
@@ -854,11 +879,68 @@ export class Harness {
   private failExecution(message: string): HarnessExecutionResult {
     this.logger?.error(`[Harness] 执行失败: ${message}`);
     this.stateMachine.transition({ type: 'FAIL', reason: message });
+    const summary = this.finalizeSummary('FAILED');
     return {
       success: false,
       finalState: 'FAILED',
-      message,
+      message: summary ? `${message}\n${this.formatSummaryMessage(summary)}` : message,
       waitingForHuman: false,
     };
+  }
+
+  // ============================================================
+  // Trace / Metrics 辅助
+  // ============================================================
+
+  /** 读取实例目录下 trace-id.txt；不存在则生成 UUID 并持久化（快照恢复后链路 ID 保持一致） */
+  private resolveOrCreateTraceId(instanceDir: string): string {
+    const fs = require('fs');
+    try {
+      if (!fs.existsSync(instanceDir)) fs.mkdirSync(instanceDir, { recursive: true });
+      const traceFile = path.join(instanceDir, 'trace-id.txt');
+      if (fs.existsSync(traceFile)) {
+        const existing = fs.readFileSync(traceFile, 'utf-8').trim();
+        if (existing) return existing;
+      }
+      const id = randomUUID();
+      fs.writeFileSync(traceFile, id, 'utf-8');
+      return id;
+    } catch {
+      // 持久化失败不阻断流程，退回内存生成（进程内仍可追踪）
+      return randomUUID();
+    }
+  }
+
+  /** 终态聚合指标并原子落盘 run-summary.json；失败不阻断终态返回 */
+  private finalizeSummary(finalState: string): RunSummary | null {
+    try {
+      const summary = this.metrics.writeSummary(this.instanceDir, finalState);
+      this.logger?.info(
+        `[Harness] 指标汇总已落盘: ${path.join(this.instanceDir, 'run-summary.json')}`,
+        { instanceId: this.instanceId, traceId: this.traceId },
+      );
+      return summary;
+    } catch (err) {
+      this.logger?.warn(
+        `[Harness] run-summary 落盘失败（不影响终态）: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return null;
+    }
+  }
+
+  /** 控制台摘要文本：总调用/总 token/总耗时 + 按阶段明细 */
+  private formatSummaryMessage(summary: RunSummary): string {
+    const lines = [
+      `指标汇总：LLM 调用 ${summary.totalCalls} 次（失败 ${summary.failedCalls}），` +
+        `共 ${summary.totalTokens} tokens（prompt ${summary.totalPromptTokens} / completion ${summary.totalCompletionTokens}），` +
+        `LLM 累计耗时 ${(summary.totalDurationMs / 1000).toFixed(1)}s`,
+      '按阶段：' +
+        summary.byStage
+          .map((s) => `${s.name}=${s.totalTokens}tokens/${s.calls}次`)
+          .join('，'),
+    ];
+    return lines.join('\n');
   }
 }

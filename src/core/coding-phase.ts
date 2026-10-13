@@ -13,6 +13,7 @@ import type { StateMachine } from './state-machine';
 import type { ArtifactStore } from './artifact-store';
 import type { ContextManager } from './context-manager';
 import type { TokenBudgetTracker } from './token-budget';
+import type { MetricsCollector } from '../observability/metrics';
 import type { Logger } from '../observability/logger';
 import type { AgentContext } from '../agents/types';
 import type { PipelineStateName } from '../types/state';
@@ -46,6 +47,10 @@ export interface CodingPhaseDeps {
   tokenBudget: TokenBudgetTracker;
   projectContext: ProjectContext;
   testRequirements?: TestRequirements;
+  /** 链路追踪根 ID（Harness 生成，注入全部 AgentContext） */
+  traceId: string;
+  /** Metrics 指标聚合器（Harness 单例，注入全部 AgentContext） */
+  metrics: MetricsCollector;
 }
 
 /** 跨类回调（指向 Harness 门面，避免循环依赖） */
@@ -101,12 +106,14 @@ export class CodingPhaseRunner {
 
       const ctx: AgentContext = {
         instanceId,
+        traceId: this.deps.traceId,
         stage: 'coding',
         input: task,
         globalContext: contextManager.getGlobalContext(),
         knowledgeService: this.deps.knowledgeService,
         projectId: this.deps.projectId,
         tokenBudget: this.deps.tokenBudget,
+        metrics: this.deps.metrics,
       };
 
       try {

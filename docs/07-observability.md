@@ -59,13 +59,39 @@ AI 系统比传统系统更需要可观测性——输出不确定，出了问�
 
 ### 存储
 
-按实例分文件：
+按实例分文件（CLI 统一布局，`{output}/{project}/` 即实例目录）：
 ```
-data/instances/{instance_id}/logs/
-├── pipeline.log      # 流程级日志
-├── llm.log           # LLM 调用详细日志
-└── error.log         # 错误日志
+{instanceDir}/
+├── logs/
+│   ├── pipeline.log      # 流程级日志（结构化 JSON Lines，含 traceId/stage/agent）
+│   ├── llm-calls.log     # LLM 调用完整 prompt/response/token/耗时
+│   └── error.log         # 错误日志
+├── test-failures/        # 测试环境异常失败现场（#11）
+│   └── tdd-{timestamp}/  # 完整临时目录快照 + error.txt
+├── artifacts/            # 各阶段产物
+├── state.json            # 状态快照（--resume）
+├── trace-id.txt          # 全流程根 traceId
+└── run-summary.json      # 终态指标汇总（#13）
 ```
+
+### 失败现场保留（#11）
+
+子进程测试的两类失败必须区分：
+
+| 失败类型 | 含义 | 处理 |
+|---|---|---|
+| **断言失败** | vitest 真实运行，用例不通过 | TDD 红绿循环的正常输入，失败信息喂回 LLM 修复，不保留现场 |
+| **环境异常** | vitest 不存在 / spawn 失败 / 超时 / 无有效输出 | 临时目录完整拷贝到 `test-failures/tdd-{timestamp}/` 并写 `error.txt`，再降级静态推断 |
+
+环境异常的现场（测试文件、vitest 配置、错误原因）是排查"为什么子进程跑不起来"的直接证据，
+不会随临时目录清理而丢失。CodingAgent 的 red/green 测试执行日志同时记录
+`runner`（static/scriptable/subprocess）、`environment`、`degraded`（是否已降级）与 `outputSummary`，
+避免"真实执行静默降级为静态推断"而无感知。
+
+### PARSE_ERROR 原始输出（#12）
+
+LLM 输出格式漂移导致 JSON 解析失败时，日志记录 `rawLength` 与 `rawContentHead`（前 2000 字符），
+并提示按 traceId 查 `llm-calls.log` 获取完整原文——不再只记"解析失败"而无法看到模型实际返回了什么。
 
 ## 第二层：链路追踪
 
@@ -91,8 +117,14 @@ trace: inst_abc123 (总耗时 5min)
 
 每个 span 记录：阶段名、开始/结束时间、状态（成功/失败/回退/挂起）、输入摘要、输出产物路径、错误信息。
 
-> ⚠️ **实现状态（#85 同步）**：目标态为 PostgreSQL `spans` 表按 instance_id 查完整调用链，v1 未实现——
-> 当前通过 `data/instances/{id}/logs/pipeline.log` 的时间线与产物版本链做人工溯源（Tracer 见实现状态表）。
+> ✅ **实现状态（traceId 已落地）**：v1 以 **traceId 全链路透传**实现日志层追踪——
+> Harness 构造时生成 UUID 作为全流程根 traceId，独立持久化到 `{instanceDir}/trace-id.txt`
+>（快照恢复后 traceId 保持一致），注入每个 AgentContext 与全部 LLM 请求；
+> 所有结构化日志（含 BaseAgent 重试/预算/解析失败、CodingAgent 红绿测试执行、降级分支）均带 traceId。
+> 目标态 PostgreSQL `spans` 表（按 instance_id 查 span 树）为 v2。
+>
+> **排障路径**：按 traceId 聚合 `pipeline.log` 时间线 → 按 traceId 查 `llm-calls.log` 完整 prompt/response
+> → 环境异常时查 `test-failures/tdd-*/` 失败现场（测试文件 + error.txt）。
 
 ## 第三层：指标
 
@@ -115,10 +147,18 @@ trace: inst_abc123 (总耗时 5min)
 
 ### 存储与展示
 
-> ⚠️ **实现状态（#85 同步）**：目标态为 PostgreSQL `metrics` 表流程结束聚合写入，v1 未实现——
-> 当前指标靠 Logger 输出（token 统计、阶段耗时）与流水线日志人工汇总。查看方式（目标态）：
-- CLI 命令：`forge stats --instance xxx`、`forge stats --overview`
-- 简单 HTML 统计页面（可选）
+> ✅ **实现状态（MetricsCollector 已落地，#13）**：`src/observability/metrics.ts`——
+> Harness 创建单例并注入每个 AgentContext，BaseAgent 在每次 LLM 调用成功后按
+> **stage/agent 双维度**聚合：调用次数、失败数、prompt/completion/total tokens、累计耗时；
+> 流程终态（COMPLETED/FAILED/CANCELLED）原子落盘 `{instanceDir}/run-summary.json`，
+> 并在 CLI 终态输出摘要（总调用/总 token/总耗时 + 按阶段明细）。
+>
+> run-summary.json 是性能基准（#87：各阶段耗时/token 基线，用于发现回归）与成本核算的数据源；
+> 与 TokenBudgetTracker（预算控制，事前阻断）互补。
+>
+> 目标态（v2）：PostgreSQL `metrics` 表、`forge stats` 命令、跨实例 P50/P95/P99 聚合。
+- CLI 命令（v2）：`forge stats --instance xxx`、`forge stats --overview`
+- 简单 HTML 统计页面（v2，可选）
 
 不需要 Prometheus/Grafana，指标体系稳定后再上。
 
@@ -196,10 +236,11 @@ trace: inst_abc123 (总耗时 5min)
 
 | 层级 | 组件 | 状态 |
 |---|---|---|
-| 第一层：日志 | Logger（结构化日志 + LLM 调用记录） | ✅ 已实现 |
-| 第二层：链路追踪 | Tracer（span 记录） | ⏳ 待实现（按需补充） |
-| 第三层：指标 | MetricsCollector | ⏳ 待实现（按需补充） |
+| 第一层：日志 | Logger（结构化日志 + LLM 调用记录） | ✅ 已实现（全日志带 traceId/stage；PARSE_ERROR 记录原始输出片段，#12） |
+| 第二层：链路追踪 | traceId 全链路透传（trace-id.txt + 日志聚合） | ✅ v1 已实现（span 树/PostgreSQL 为 v2） |
+| 第二层：失败现场 | test-failures/ 环境异常现场保留 | ✅ 已实现（#11，仅环境异常；断言失败不保留） |
+| 第三层：指标 | MetricsCollector（run-summary.json） | ✅ 已实现（#13，stage/agent 双维度；跨实例聚合为 v2） |
 | 第四层：质量与成本分析 | 质量评估、成本追踪 | ⏳ 待实现（v1 后期） |
 | 预算控制（ADR-014 前置） | TokenBudgetTracker（#39） | ✅ 已实现：maxTokensPerRun / maxTokensPerCall，Agent 调用前后检查，超限暂停流程 |
 
-当前 Logger 已支持：分级输出（debug/info/warn/error）、JSON Lines 格式、LLM 调用完整 prompt/response 记录、按实例分文件（data/instances/{id}/logs/pipeline.log + llm-calls.log）、console + 文件双通道、写入失败 console.warn 降级。
+当前 Logger 已支持：分级输出（debug/info/warn/error）、JSON Lines 格式、LLM 调用完整 prompt/response 记录、按实例分文件（pipeline.log + llm-calls.log + error.log）、console + 文件双通道、写入失败 console.warn 降级。

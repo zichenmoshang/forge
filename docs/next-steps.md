@@ -2,10 +2,10 @@
 
 ## 当前状态
 
-设计阶段完成，工程基础设施已搭建，核心模块、Agent 基类、需求分析 Agent、方案设计 Agent、方案评审 Agent（含方案多轮+代码 CR 多轮）、编码 Agent（单故事 TDD + 逐故事循环 + 部分成功出口 + CR 内 revise）、交付 Agent（场景判定+新项目初始化+代码落盘+构建验证+Git+PR描述）、Harness、ContextManager、知识库基础设施（含飞书文档同步）、可替换编码工具层（Workspace/TestRunner + 真实子进程执行 #83）、可替换交付工具层（FileSystem/Git/Build）、评审统一判定规则、需求冻结质量门、方案覆盖度、编码规划/聚合/校验纯函数已实现。共 370 个测试全部通过（28 文件）。
+设计阶段完成，工程基础设施已搭建，核心模块、Agent 基类、需求分析 Agent、方案设计 Agent、方案评审 Agent（含方案多轮+代码 CR 多轮）、编码 Agent（单故事 TDD + 逐故事循环 + 部分成功出口 + CR 内 revise）、交付 Agent（场景判定+新项目初始化+代码落盘+构建验证+Git+PR描述）、Harness、ContextManager、知识库基础设施（含飞书文档同步）、可替换编码工具层（Workspace/TestRunner + 真实子进程执行 #83）、可替换交付工具层（FileSystem/Git/Build）、评审统一判定规则、需求冻结质量门、方案覆盖度、编码规划/聚合/校验纯函数、可观测性（traceId 全链路 + MetricsCollector + 失败现场保留）已实现。共 375 个测试全部通过（30 文件）。
 
-**最近完成批次（2026-10）**：#81 技术方案校验放宽（error→warning）、#39 预算控制落地（TokenBudgetTracker）、#82 状态持久化（FileSystemArtifactStore + state.json + `--resume`）、#83 真实测试执行（LocalSubprocessTestRunner，CLI 默认，失败降级静态）。
-**待办高优先级**：#47 Harness 拆分瘦身、#84 知识库质量与单例问题、#85 文档同步（本批已执行）、#86 弱介入窗口设计、#38 回退成本预警。
+**最近完成批次（2026-10）**：#81 技术方案校验放宽（error→warning）、#39 预算控制落地（TokenBudgetTracker）、#82 状态持久化（FileSystemArtifactStore + state.json + `--resume`）、#83 真实测试执行（LocalSubprocessTestRunner，CLI 默认，失败降级静态）、#47 Harness 拆分瘦身、#85 文档同步；第二十轮可观测性缺口修复（traceId 透传 / 测试日志 environment-runner / test-failures 现场保留 / PARSE_ERROR 原始输出 / run-summary.json）。
+**待办高优先级**：下一轮真实端到端验证（验证可观测性产物 + 技术方案阶段可推进）、#84 知识库质量与单例问题、#86 弱介入窗口设计、#38 回退成本预警、#87 基于 run-summary 建立性能基准。
 
 ## 已完成
 
@@ -202,8 +202,9 @@ v1 需要使用知识库验证 Harness 和 DesignAgent 的正确性，因此知�
 
 ### 后续
 
-- #47 Harness 拆分瘦身（ExecutionScheduler + ReviewDialogRunner + CodingPhaseRunner，Harness 保留门面）
+- 下一轮真实端到端验证（forge run --auto-confirm）：确认 trace-id/state/run-summary/test-failures 可观测性产物齐备、技术方案阶段可推进
 - #84 知识库质量保证（多项目单例隔离、内容校验、过期检测）
+- #87 基于多轮 run-summary 建立各阶段性能基准
 - #86 弱介入窗口与人工交互设计优化
 - #38 回退成本预警
 - 飞书文档增量同步 + 定时同步（v2）

@@ -19,6 +19,7 @@ import * as path from 'path';
 import type { TestResult } from '../types/coding-task';
 import type { Workspace, TestRunner, TestRunOptions } from './types';
 import { StaticTestRunner } from './static-test-runner';
+import type { Logger } from '../observability/logger';
 
 /** LocalSubprocessTestRunner 选项 */
 export interface LocalSubprocessOptions {
@@ -32,6 +33,14 @@ export interface LocalSubprocessOptions {
   vitestEntry?: string;
   /** 测试环境（默认 node，组件测试可传 jsdom） */
   environment?: 'node' | 'jsdom';
+  /**
+   * 环境异常（spawn 失败/vitest 不存在/超时/无输出）时失败现场保留目录，
+   * 会把临时目录完整拷贝到 {failureArtifactDir}/tdd-{timestamp} 并写 error.txt；
+   * 正常断言失败不保留（属于 TDD 循环输入，不是环境问题）。
+   */
+  failureArtifactDir?: string;
+  /** 日志器：降级与失败现场保留路径落日志，便于真实运行时定位 */
+  logger?: Logger;
 }
 
 interface VitestAssertion {
@@ -144,6 +153,8 @@ export class LocalSubprocessTestRunner implements TestRunner {
   private readonly keepTempDir: boolean;
   private readonly vitestEntry?: string;
   private readonly environment: 'node' | 'jsdom';
+  private readonly failureArtifactDir?: string;
+  private readonly logger?: Logger;
   private readonly staticRunner: StaticTestRunner;
 
   constructor(options?: LocalSubprocessOptions) {
@@ -152,6 +163,8 @@ export class LocalSubprocessTestRunner implements TestRunner {
     this.keepTempDir = options?.keepTempDir ?? false;
     this.vitestEntry = options?.vitestEntry;
     this.environment = options?.environment ?? 'node';
+    this.failureArtifactDir = options?.failureArtifactDir;
+    this.logger = options?.logger;
     this.staticRunner = new StaticTestRunner();
   }
 
@@ -161,6 +174,13 @@ export class LocalSubprocessTestRunner implements TestRunner {
       return await this.runSubprocess(workspace, options);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
+      this.logger?.warn(
+        `[LocalSubprocessTestRunner] 子进程测试环境异常: ${reason}${
+          this.failureArtifactDir
+            ? `（失败现场已保留到 ${this.failureArtifactDir}，含测试文件与 error.txt）`
+            : ''
+        }`,
+      );
       if (this.fallbackToStatic) {
         const staticResult = await this.staticRunner.run(workspace, options);
         return {
@@ -280,6 +300,17 @@ export class LocalSubprocessTestRunner implements TestRunner {
           `[subprocess] ${options.phase} 阶段真实执行 vitest：共 ${parsed.totalTests} 个用例，` +
           `通过 ${parsed.passedTests}、失败 ${parsed.failedTests}、跳过 ${parsed.skippedTests}`,
       };
+    } catch (err) {
+      // 环境异常（vitest 不存在/spawn 失败/超时/无有效输出）：保留完整现场后再抛出，
+      // 由外层 run() 决定降级静态推断；正常断言失败不会走到这里（JSON 解析成功即正常返回）
+      const reason = err instanceof Error ? err.message : String(err);
+      const artifactPath = this.preserveFailureArtifact(tmpDir, reason);
+      if (artifactPath) {
+        this.logger?.warn(
+          `[LocalSubprocessTestRunner] 失败现场已保留: ${artifactPath}`,
+        );
+      }
+      throw err;
     } finally {
       if (!keep) {
         try {
@@ -288,6 +319,25 @@ export class LocalSubprocessTestRunner implements TestRunner {
           // 清理失败不影响结果
         }
       }
+    }
+  }
+
+  /** 把临时目录完整拷贝到失败现场目录并写 error.txt；返回现场路径，失败返回 undefined */
+  private preserveFailureArtifact(tmpDir: string, errorMessage: string): string | undefined {
+    if (!this.failureArtifactDir) return undefined;
+    try {
+      fs.mkdirSync(this.failureArtifactDir, { recursive: true });
+      const target = path.join(this.failureArtifactDir, `tdd-${Date.now()}`);
+      fs.cpSync(tmpDir, target, { recursive: true });
+      fs.writeFileSync(path.join(target, 'error.txt'), `${errorMessage}\n`, 'utf-8');
+      return target;
+    } catch (preserveErr) {
+      this.logger?.warn(
+        `[LocalSubprocessTestRunner] 失败现场保留失败: ${
+          preserveErr instanceof Error ? preserveErr.message : String(preserveErr)
+        }`,
+      );
+      return undefined;
     }
   }
 

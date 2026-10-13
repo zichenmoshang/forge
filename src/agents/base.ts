@@ -123,7 +123,12 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
           retries++;
           this.logger?.warn(
             `[${this.name}] 第 ${attempt} 次重试，原因: ${lastErrors.map((e) => e.message).join('; ')}`,
-            { instanceId: context.instanceId, agent: this.name },
+            {
+              instanceId: context.instanceId,
+              traceId: context.traceId,
+              stage: context.stage,
+              agent: this.name,
+            },
           );
           await this.sleep(this.config.retryBaseDelayMs * attempt);
         }
@@ -133,7 +138,12 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
         if (budget?.isExceeded()) {
           this.logger?.error(
             `[${this.name}] Token 预算已超限（${budget.usedTokens}/${budget.limitTokens}），停止本次调用`,
-            { instanceId: context.instanceId, agent: this.name },
+            {
+              instanceId: context.instanceId,
+              traceId: context.traceId,
+              stage: context.stage,
+              agent: this.name,
+            },
           );
           return this.buildFailure<TO>(
             [
@@ -162,13 +172,31 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
         const response = await this.llm.complete(llmRequest);
         llmCalls++;
 
+        // Metrics：记录本次调用指标（终态聚合 run-summary，#87 性能基准数据源）
+        context.metrics?.recordCall({
+          stage: context.stage,
+          agent: this.name,
+          model: response.model,
+          promptTokens: response.promptTokens,
+          completionTokens: response.completionTokens,
+          totalTokens: response.totalTokens,
+          durationMs: response.durationMs,
+          success: true,
+          finishReason: response.finishReason,
+        });
+
         // 预算控制：调用后累计本次 token；单次调用超限按失败处理（防异常膨胀）
         if (budget) {
           const perCall = budget.checkPerCall(response.totalTokens);
           if (!perCall.ok) {
             this.logger?.error(
               `[${this.name}] 单次调用超限: ${perCall.reason}`,
-              { instanceId: context.instanceId, agent: this.name },
+              {
+                instanceId: context.instanceId,
+                traceId: context.traceId,
+                stage: context.stage,
+                agent: this.name,
+              },
             );
             return this.buildFailure<TO>(
               [
@@ -187,7 +215,12 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
           if (acc.exceeded) {
             this.logger?.warn(
               `[${this.name}] 本次调用后累计 token ${acc.used}/${acc.limit}，已触及预算上限`,
-              { instanceId: context.instanceId, agent: this.name },
+              {
+                instanceId: context.instanceId,
+                traceId: context.traceId,
+                stage: context.stage,
+                agent: this.name,
+              },
             );
           }
         }
@@ -204,6 +237,21 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
               severity: 'error',
             },
           ];
+          // 原始输出片段一并落日志：LLM 输出格式漂移时可直接定位（完整原文在 llm-calls.log，按 traceId 关联）
+          this.logger?.warn(
+            `[${this.name}] 输出解析失败，原始输出片段见 data 字段（完整原文查 llm-calls.log，traceId=${context.traceId ?? '无'}）`,
+            {
+              instanceId: context.instanceId,
+              traceId: context.traceId,
+              stage: context.stage,
+              agent: this.name,
+            },
+            {
+              parseErrorMessage: err instanceof Error ? err.message : String(err),
+              rawLength: response.content.length,
+              rawContentHead: response.content.slice(0, 2000),
+            },
+          );
           continue; // 解析失败，重试
         }
 
@@ -220,7 +268,12 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
 
         this.logger?.info(
           `[${this.name}] 执行成功，耗时 ${Date.now() - startTime}ms，LLM 调用 ${llmCalls} 次`,
-          { instanceId: context.instanceId, agent: this.name },
+          {
+            instanceId: context.instanceId,
+            traceId: context.traceId,
+            stage: context.stage,
+            agent: this.name,
+          },
         );
 
         return {
@@ -236,7 +289,12 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
       // 重试耗尽
       this.logger?.error(
         `[${this.name}] 执行失败，重试 ${retries} 次后仍未通过校验`,
-        { instanceId: context.instanceId, agent: this.name },
+        {
+          instanceId: context.instanceId,
+          traceId: context.traceId,
+          stage: context.stage,
+          agent: this.name,
+        },
         { errors: lastErrors },
       );
 
@@ -250,6 +308,8 @@ export abstract class BaseAgent<I = unknown, O = unknown> {
 
       this.logger?.error(`[${this.name}] 执行异常: ${error.message}`, {
         instanceId: context.instanceId,
+        traceId: context.traceId,
+        stage: context.stage,
         agent: this.name,
       });
 

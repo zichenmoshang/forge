@@ -18,6 +18,7 @@ import type { StateMachine } from './state-machine';
 import type { ArtifactStore } from './artifact-store';
 import type { ContextManager } from './context-manager';
 import type { TokenBudgetTracker } from './token-budget';
+import type { MetricsCollector } from '../observability/metrics';
 import type { Logger } from '../observability/logger';
 import type { BaseAgent } from '../agents/base';
 import type { CodingAgent } from '../agents/coding-agent';
@@ -56,6 +57,10 @@ export interface ReviewDialogDeps {
   knowledgeService?: KnowledgeService;
   projectId?: string;
   tokenBudget: TokenBudgetTracker;
+  /** 链路追踪根 ID（Harness 生成，注入全部 AgentContext） */
+  traceId: string;
+  /** Metrics 指标聚合器（Harness 单例，注入全部 AgentContext） */
+  metrics: MetricsCollector;
 }
 
 /** 跨类回调（指向 Harness 门面，避免循环依赖） */
@@ -148,6 +153,8 @@ export class ReviewDialogRunner {
         knowledgeService: this.deps.knowledgeService,
         projectId: this.deps.projectId,
         tokenBudget: this.deps.tokenBudget,
+        traceId: this.deps.traceId,
+        metrics: this.deps.metrics,
       };
 
       const reviewResult = await reviewAgent.execute(reviewCtx);
@@ -222,6 +229,8 @@ export class ReviewDialogRunner {
         knowledgeService: this.deps.knowledgeService,
         projectId: this.deps.projectId,
         tokenBudget: this.deps.tokenBudget,
+        traceId: this.deps.traceId,
+        metrics: this.deps.metrics,
       };
       const reviseResult = await designAgent.revise(reviseCtx);
       if (!reviseResult.success || !reviseResult.data) {
@@ -389,6 +398,8 @@ export class ReviewDialogRunner {
         knowledgeService: this.deps.knowledgeService,
         projectId: this.deps.projectId,
         tokenBudget: this.deps.tokenBudget,
+        traceId: this.deps.traceId,
+        metrics: this.deps.metrics,
       };
 
       const reviewResult = await reviewAgent.execute(reviewCtx);
@@ -478,6 +489,8 @@ export class ReviewDialogRunner {
           knowledgeService: this.deps.knowledgeService,
           projectId: this.deps.projectId,
           tokenBudget: this.deps.tokenBudget,
+          traceId: this.deps.traceId,
+          metrics: this.deps.metrics,
         };
 
         try {

@@ -1,8 +1,15 @@
 # Forge 待解决问题
 
-> 最后更新：2026-10-12
+> 最后更新：2026-10-13
+> 第二十轮可观测性缺口修复（2026-10-13，针对"真实运行怎么知道哪里出问题"五项缺口，全部修复）：
+> 1. **traceId 全链路透传（P0）**：Harness 构造生成 UUID 根 traceId 并持久化 `trace-id.txt`（快照恢复保持一致），注入全部 7 处 AgentContext 与 LLM 请求；BaseAgent 所有日志点（重试/预算超限/单次超限/成功/重试耗尽/异常）补齐 traceId/stage；
+> 2. **测试执行日志补 environment/runner（P0）**：CodingAgent red/green 每次测试执行记录 runner（static/scriptable/subprocess）、environment、degraded（降级标注）、计数与 outputSummary，杜绝"静默降级静态推断"无感知；
+> 3. **测试失败现场保留（P1）**：LocalSubprocessTestRunner 环境异常（vitest 不存在/spawn 失败/超时/无输出）时把临时目录完整拷贝到 `test-failures/tdd-{timestamp}/` 并写 error.txt；正常断言失败不保留（TDD 正常输入）；
+> 4. **PARSE_ERROR 记录原始 LLM 输出（P1）**：解析失败日志带 rawLength 与 rawContentHead（前 2000 字符），提示按 traceId 查 llm-calls.log 完整原文；
+> 5. **Metrics 汇总（P2）**：新增 `src/observability/metrics.ts` MetricsCollector，按 stage/agent 双维度聚合调用次数/失败/token/耗时，终态（COMPLETED/FAILED/CANCELLED）原子落盘 `run-summary.json` 并在 CLI 打印摘要，为 #87 性能基准与成本核算提供数据源。
+> 实例目录统一布局：CLI 直接以 `{output}/{project}/` 为 instanceDir（state.json/trace-id.txt/run-summary.json/logs/artifacts/test-failures 同根）。全量 **375 测试 / 30 文件全绿**（新增 metrics 单测 5 例），tsc 零错误。设计文档 docs/07-observability.md 已同步。
 > 第十九轮修复（2026-10-12，用户指定 #47/#83/#85）：#83 真实测试执行落地（LocalSubprocessTestRunner：工作区落盘项目 .sandbox 真实跑 vitest 子进程、解析 JSON 输出还原真实通过/失败/失败原因，red 无实现→真实 import 解析失败、假测试真实全绿被 RED_SHOULD_FAIL 拦截、实现 bug→真实断言错误回流修复循环；vitest 不可用/超时降级 StaticTestRunner 并明确标注，fallbackToStatic=false 返回环境失败；`--test-mode static|subprocess` 可切换；单测 6 用例全绿）；#47 Harness 拆分瘦身（拆出 ReviewDialogRunner / CodingPhaseRunner / state-transitions 纯函数 / human-interaction 纯逻辑，Harness 保留门面+主循环+持久化，1561 行→约 950 行，行为零变化，全量 370 测试全绿）；#85 设计文档与实现同步（02-pipeline / 03-architecture / 06-storage / 07-observability / coding-standards / decisions-ADR / schema-state-machine / next-steps 全面标注"实现状态"，修正向量模型 2048 维、v1 文件系统+内存向量、TDD 真实执行、状态持久化 #82、飞书同步已落地等不一致）；顺带修复 vitest 全量扫描误收 .sandbox 调试残留（新增 vitest.config.ts exclude .sandbox/data/.tmp/output，.gitignore 追加忽略）。
-> 已完成问题的经验教训已沉淀到 [开发规范](coding-standards.md)。
+> 已完成问题的经验教训已沉淀到 [开发规范](docs/coding-standards.md)。
 > 第十八轮全面设计审查（架构/流程/状态机/存储/可观测性 5 维度）：发现 25 个问题（4 严重 S1-S4 + 5 重要 I1-I5 + 6 建议 O1-O6 + 10 与已有合并）。其中 S1（技术方案输出超 LLM 能力，#81）、S3（预算控制未落地，#39/#46）、S4（Harness 1258 行职责过重，#47）、I2（回退成本高，#38）与已有问题合并并升级严重度；新增 S2（状态持久化未实现）、I1（TDD 是模拟的）、I3（知识库单例+质量缺失）、I4（设计文档与实现不同步）、I5（弱介入窗口设计不匹配）、O1-O6。删除已解决的 #9（CLI 入口）和第十六轮遗留中的 #79/#80。
 > 第四轮复查（10 个问题）已全部修复，见规范文档第九章修复历史。
 > 第五轮端到端验证（14 个测试）发现 1 个 bug（#37 humanAnswers 丢失），已修复。
@@ -427,10 +434,11 @@
 
 | 字段 | 内容 |
 |------|------|
-| **状态** | 💡 建议优化 |
+| **状态** | 🟡 部分解决（第二十轮：数据源已具备） |
 | **说明** | 设计没有定义各阶段的预期耗时、token 消耗、输出量。当前验证中故事拆解 40 分钟、技术方案超时都是"意外"。如果有性能基准可以提前发现问题 |
-| **建议** | 建立性能基准文档，标注每个阶段的预期输出量、耗时、token，作为优化目标和回归测试依据。例如：需求澄清 followup < 1000 tokens/10 秒；故事拆解每批 < 6 功能点/10 分钟；技术方案 < 15000 tokens/15 分钟 |
-| **处理时机** | 完整端到端验证跑通后，基于实测数据建立基准 |
+| **进展** | 第二十轮 MetricsCollector 终态落盘 `run-summary.json`（各阶段调用次数/token/耗时），性能基准的**数据源已具备**；基准文档（预期阈值表）待基于多轮实测数据建立 |
+| **建议** | 积累 3-5 次真实运行的 run-summary 后，建立各阶段基准（如需求澄清 followup < 1000 tokens/10 秒；故事拆解每批 < 6 功能点/10 分钟；技术方案 < 15000 tokens/15 分钟），并在后续运行中自动对比发现回归 |
+| **处理时机** | 下一轮真实端到端验证后 |
 
 #### #88 错误处理和兜底策略不具体（O2 建议）
 
@@ -463,10 +471,11 @@
 
 | 字段 | 内容 |
 |------|------|
-| **状态** | 💡 建议优化 |
-| **说明** | 07-observability.md 设计有四层（日志、链路追踪、指标、质量成本分析），v1 只实现了日志（Logger）。长流程调试缺乏链路追踪和指标，当前只能靠日志文件手动分析，效率低 |
-| **建议** | 1. 优先实现链路追踪（span 记录，成本低价值高）：每个阶段记录开始/结束时间、状态、输入摘要、输出产物路径；2. 实现基本指标聚合：流程结束时写入 JSON 指标文件（总耗时、各阶段耗时、token 消耗、成功率）；3. 提供 CLI 命令查看指标：`forge stats --instance xxx` |
-| **处理时机** | v1 后期，建议在完整端到端验证跑通后实现链路追踪 |
+| **状态** | 🟡 部分解决（第二十轮：第一层完整 + 第二/三层 v1 形态落地） |
+| **说明** | 07-observability.md 设计有四层（日志、链路追踪、指标、质量成本分析），此前 v1 只实现了日志（Logger）。长流程调试缺乏链路追踪和指标，只能靠日志文件手动分析，效率低 |
+| **第二十轮进展** | ①第一层日志：全日志带 traceId/stage，PARSE_ERROR 记录原始输出；②第二层链路追踪 v1 形态：traceId 全链路透传 + trace-id.txt + 环境异常失败现场保留（test-failures/），span 树仍为 v2；③第三层指标 v1 形态：MetricsCollector + run-summary.json（stage/agent 双维度），跨实例聚合/forge stats 为 v2；④第四层质量成本分析仍待实现 |
+| **建议（剩余）** | v2：PostgreSQL spans/metrics 表、`forge stats`、P50/P95/P99、产物质量自动评分 |
+| **处理时机** | 第四层 v1 后期；span 树/持久化 v2 |
 
 #### #92 Agent 无状态设计与多轮对话需求矛盾（O6 建议）
 

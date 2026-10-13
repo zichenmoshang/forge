@@ -327,6 +327,27 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
       testResult: redRun.allPassed ? 'pass' : 'fail',
       durationMs: Date.now() - redStart,
     });
+    this.logger?.info(
+      `[CodingAgent] red 测试执行：runner=${this.testRunner.kind} environment=${redRun.environment} ` +
+        `结果 ${redRun.passedTests}/${redRun.totalTests} 通过${
+          /已降级/.test(redRun.outputSummary ?? '') ? '（已降级静态推断）' : ''
+        }`,
+      {
+        instanceId: context.instanceId,
+        traceId: context.traceId,
+        stage: 'coding',
+        agent: this.name,
+      },
+      {
+        runner: this.testRunner.kind,
+        environment: redRun.environment,
+        degraded: /已降级/.test(redRun.outputSummary ?? ''),
+        totalTests: redRun.totalTests,
+        passedTests: redRun.passedTests,
+        failedTests: redRun.failedTests,
+        outputSummary: redRun.outputSummary,
+      },
+    );
 
     // 质量门：red 必须失败；若直接通过，说明测试未依赖实现（假测试）
     if (redRun.allPassed) {
@@ -399,6 +420,27 @@ export class CodingAgent extends BaseAgent<CodingTask, RedTddOutput> {
         testResult: lastRun.allPassed ? 'pass' : 'fail',
         durationMs: Date.now() - gStart,
       });
+      this.logger?.info(
+        `[CodingAgent] green 第 ${attempt} 次测试执行：runner=${this.testRunner.kind} environment=${lastRun.environment} ` +
+          `结果 ${lastRun.passedTests}/${lastRun.totalTests} 通过${
+            /已降级/.test(lastRun.outputSummary ?? '') ? '（已降级静态推断）' : ''
+          }`,
+        {
+          instanceId: context.instanceId,
+          traceId: context.traceId,
+          stage: 'coding',
+          agent: this.name,
+        },
+        {
+          runner: this.testRunner.kind,
+          environment: lastRun.environment,
+          degraded: /已降级/.test(lastRun.outputSummary ?? ''),
+          totalTests: lastRun.totalTests,
+          passedTests: lastRun.passedTests,
+          failedTests: lastRun.failedTests,
+          outputSummary: lastRun.outputSummary,
+        },
+      );
 
       if (candidate.needsDesignFallback) {
         // 方案性问题：停止编码，交由 Harness 决定是否回退阶段3

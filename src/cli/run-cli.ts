@@ -182,10 +182,15 @@ export async function runForgeCli(args: string[]): Promise<void> {
   // 7. 创建 Agents
   const workspace = new InMemoryWorkspace();
   // TDD 真实执行（issue #83）：默认子进程运行 vitest 验证代码逻辑，static 为快速通道（显式 --test-mode static）
+  // 环境异常时失败现场保留到 test-failures/（#11），降级/现场路径落日志
   const testRunner =
     options.testMode === 'static'
       ? new StaticTestRunner()
-      : new LocalSubprocessTestRunner({ fallbackToStatic: true });
+      : new LocalSubprocessTestRunner({
+          fallbackToStatic: true,
+          failureArtifactDir: path.join(projectOutputDir, 'test-failures'),
+          logger,
+        });
 
   const agents: AgentRegistry = {
     requirement: new RequirementAgent(llm, { logger }),
@@ -208,11 +213,13 @@ export async function runForgeCli(args: string[]): Promise<void> {
   console.log('[初始化] Agents: requirement / design / review / coding / delivery 全部就绪');
 
   // 8. 创建 Harness（resume 时固定实例 ID，复用其磁盘产物与状态快照）
+  // instanceDir 直接用项目输出目录：state.json/run-summary/trace-id 与 logs/artifacts 统一布局
   const harness = new Harness({
     agents,
     knowledgeService,
     projectId: options.projectName,
     instanceId: isResume ? options.resumeInstanceId : undefined,
+    instanceDir: projectOutputDir,
     globalContext: {
       techStack: 'React + TypeScript',
       projectConfig: { projectName: options.projectName },
